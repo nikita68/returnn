@@ -6044,6 +6044,38 @@ def smoothing_cross_entropy(logits,
       logits=logits, labels=soft_targets)  # shape(labels)
     return xentropy - normalizing  # shape(labels)
 
+def smoothing_cross_entropy_normalized(output, targets, label_smoothing, safe_log_opts):
+  """
+  Does label smoothed cross entropy for post-softmax output.
+  :param output: Time major output.
+  :param targets: Time major targets with one-hot vector.
+  :param label_smoothing: Label smoothing value.
+  :param safe_log_opts Safe log options.
+  :return: Returns non-reduced cross-entropy output.
+  """
+
+  out = -safe_log(output, **safe_log_opts)
+
+  # Modify targets for label smoothing
+  low_val = label_smoothing / (tf.cast(tf.shape(targets)[-1], tf.float32) - 1.0)
+  high_val = 1.0 - label_smoothing
+
+  vocab_size = tf.shape(output)[-1]
+
+  normalizing = -(label_smoothing * tf.log(label_smoothing) + tf.to_float(vocab_size - 1) *
+                  low_val * tf.log(low_val + 1e-20))  # scalar
+
+  targets = tf.one_hot(indices=targets, depth=vocab_size, on_value=high_val, off_value=low_val, axis=-1)
+
+  # out = tf.Print(out, [out[3,1], targets[3,1]], message="T", summarize=100)
+
+  out = tf.multiply(out, targets)
+
+  # regularize
+  out = out - normalizing
+
+  return out
+
 
 def softmax_cross_entropy_over_size(logits, labels, stable_gradient=True):
   """

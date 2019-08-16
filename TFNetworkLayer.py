@@ -8507,6 +8507,8 @@ _LossClassDict = {}  # type: typing.Dict[str,typing.Type[Loss]]
 
 def _init_loss_class_dict():
   from TFNetworkNeuralTransducer import NeuralTransducerLoss
+  from TFNetworkHMMFactorization import GeometricNormalizationLoss, GeometricCrossEntropy, \
+    HMMFactorizationSampledSoftmaxLoss
 
   for v in globals().values():
     if isinstance(v, type) and issubclass(v, Loss) and v.class_name:
@@ -8514,7 +8516,8 @@ def _init_loss_class_dict():
       _LossClassDict[v.class_name] = v
 
   # Outside loss functions
-  for v in [NeuralTransducerLoss]:
+  for v in [NeuralTransducerLoss, GeometricCrossEntropy, HMMFactorizationSampledSoftmaxLoss,
+            GeometricNormalizationLoss]:
     if isinstance(v, type) and issubclass(v, Loss) and v.class_name:
       assert v.class_name not in _LossClassDict
       _LossClassDict[v.class_name] = v
@@ -8545,9 +8548,11 @@ def _init_layer_class_dict():
   import TFNetworkSigProcLayer
   import TFNetworkSegModLayer
   import TFNetworkNeuralTransducer
+  import TFNetworkHMMFactorization
 
   auto_register_layer_classes(list(globals().values()))
-  for mod in [TFNetworkRecLayer, TFNetworkSigProcLayer, TFNetworkSegModLayer, TFNetworkNeuralTransducer]:
+  for mod in [TFNetworkRecLayer, TFNetworkSigProcLayer, TFNetworkSegModLayer, TFNetworkNeuralTransducer,
+              TFNetworkHMMFactorization]:
     auto_register_layer_classes(list(vars(mod).values()))
 
   for alias, v in {"forward": LinearLayer, "hidden": LinearLayer}.items():
