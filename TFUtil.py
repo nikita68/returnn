@@ -862,6 +862,27 @@ class Data(object):
     v.sanity_check()
     return v
 
+  def get_default_new_axis_for_dim_tag(self, dim_tag):
+    """
+    :param DimensionTag dim_tag:
+    :rtype: int
+    """
+    if dim_tag.kind == DimensionTag.Types.Batch:
+      return 0
+    # Note: if dim_tag is feature, but we are sparse, we just treat is as spatial, handled below.
+    if dim_tag.kind == DimensionTag.Types.Feature and not self.sparse:
+      if self.feature_dim_axis is not None:
+        return self.feature_dim_axis + 1  # after existing feature-dim
+      else:
+        return self.batch_ndim  # at the end
+    assert dim_tag.kind == DimensionTag.Types.Spatial or (dim_tag.kind == DimensionTag.Types.Feature and self.sparse)
+    if self.get_spatial_batch_axes():
+      return self.get_spatial_batch_axes()[-1] + 1  # after the existing spatial dim
+    elif self.feature_dim_axis is not None:
+      return self.feature_dim_axis  # add it before the feature dim
+    else:
+      return self.batch_ndim  # add it at the end
+
   def copy_add_dim_by_tag(self, dim_tag, unbroadcast=False, axis=None):
     """
     :param DimensionTag dim_tag:
@@ -869,8 +890,10 @@ class Data(object):
     :param int|None axis:
     :rtype: Data
     """
+    if axis is None:
+      axis = self.get_default_new_axis_for_dim_tag(dim_tag=dim_tag)
     if dim_tag.kind == DimensionTag.Types.Batch:
-      res = self.copy_add_batch_dim(batch_dim_axis=0 if axis is None else axis)
+      res = self.copy_add_batch_dim(batch_dim_axis=axis)
       if unbroadcast:
         assert res.placeholder is None  # not implemented yet...
       return res
@@ -886,21 +909,12 @@ class Data(object):
         res.sanity_check()
       return res
     assert dim_tag.kind == DimensionTag.Types.Spatial or (dim_tag.kind == DimensionTag.Types.Feature and self.sparse)
-    if axis is None:
-      if self.get_spatial_batch_axes():
-        spatial_dim_axis = self.get_spatial_batch_axes()[-1] + 1  # after the existing spatial dim
-      elif self.feature_dim_axis is not None:
-        spatial_dim_axis = self.feature_dim_axis  # add it before the feature dim
-      else:
-        spatial_dim_axis = self.batch_ndim  # add it at the end
-    else:
-      spatial_dim_axis = axis
-    res = self.copy_add_spatial_dim(spatial_dim_axis=spatial_dim_axis, dim=1)
-    assert res.batch_shape[spatial_dim_axis] == 1
+    res = self.copy_add_spatial_dim(spatial_dim_axis=axis, dim=1)
+    assert res.batch_shape[axis] == 1
     if unbroadcast:
       assert res.placeholder is None  # not implemented yet...
       shape = list(res.shape)
-      shape[res.get_batch_axis_excluding_batch(spatial_dim_axis)] = dim_tag.dimension
+      shape[res.get_batch_axis_excluding_batch(axis)] = dim_tag.dimension
       res.shape = tuple(shape)
       if res.feature_dim_axis is not None:
         # feature dim axis might have changed if unspecified, so just update dim
@@ -909,7 +923,7 @@ class Data(object):
       if dim_tag.dimension is None and dim_tag.dyn_size is not None:
         if res.size_placeholder is None:
           res.size_placeholder = {}
-        res.size_placeholder[res.get_batch_axis_excluding_batch(spatial_dim_axis)] = dim_tag.dyn_size
+        res.size_placeholder[res.get_batch_axis_excluding_batch(axis)] = dim_tag.dyn_size
     return res
 
   def copy_split_feature_dim(self, new_feature_dim):
@@ -1321,6 +1335,12 @@ class Data(object):
     if self.batch_dim_axis is not None:
       return self.shape[:self.batch_dim_axis] + (batch_dim,) + self.shape[self.batch_dim_axis:]
     return self.shape
+
+  def get_dynamic_batch_shape(self):
+    """
+    :rtype: list[int|tf.Tensor]
+    """
+    return [self.get_dim(axis) for axis in range(self.batch_ndim)]
 
   @property
   def shape_dense(self):
@@ -2111,25 +2131,38 @@ class Data(object):
     return tuple([self.get_dim_tag(i) for i in range(self.batch_ndim)])
 
   @classmethod
-  def get_common_data(cls, sources, warnings_out=None):
+  def get_common_data(cls, sources, warnings_out=None, out_shape=None):
     """
     :param list[Data] sources:
     :param io.TextIOBase|None warnings_out:
+    :param list[int|tf.Tensor]|None out_shape: will insert the shape dynamically
     :return: some generic data where the sources should be compatible to (with copy_compatible_to),
       i.e. it contains the union of all axes from all sources (least common multiple).
     :rtype: Data|None
     """
+    assert not out_shape
     if not sources:
       return None
     assert sources
+    if len(sources) == 1:
+      if out_shape is not None:
+        out_shape.extend(sources[0].get_dynamic_batch_shape())
+      return sources[0]
     max_ndim = max([s.batch_ndim for s in sources])
-    largest_source = [s for s in sources if s.batch_ndim == max_ndim][0]
+    # Try with the (first) largest.
+    common = [s for s in sources if s.batch_ndim == max_ndim][0]
+    if out_shape is not None:
+      out_shape.extend(common.get_dynamic_batch_shape())
+    if not common.beam_size and any([s.beam_size for s in sources]):
+      common = common.copy()
+      # Note: we don't use copy_extend_with_beam because we don't want to create any ops in the TF graph at this point.
+      common.beam_size = max([s.beam_size or 0 for s in sources])
     is_equal_opts = dict(ignore_feature_dim=True)
-    all_dim_tags, _ = DimensionTag.get_all_dimension_tags(sources, is_equal_opts=is_equal_opts)
+    all_dim_tags, tags_dict = DimensionTag.get_all_dimension_tags(sources, is_equal_opts=is_equal_opts)
     # Note: We cannot compare len(all_dims_tags) to len(shape) as e.g. shape (B,1,1,D) would have only 3 dim tags.
-    largest_dim_tags, _ = DimensionTag.get_all_dimension_tags([largest_source], is_equal_opts=is_equal_opts)
+    largest_dim_tags, _ = DimensionTag.get_all_dimension_tags([common], is_equal_opts=is_equal_opts)
     if len(largest_dim_tags) == len(all_dim_tags):
-      return largest_source
+      return common
     if any([not dim_tag.can_compare() for dim_tag in largest_dim_tags]):
       if warnings_out:
         print(
@@ -2137,12 +2170,15 @@ class Data(object):
             sources, all_dim_tags, [dim_tag for dim_tag in largest_dim_tags if not dim_tag.can_compare()]),
           file=warnings_out)
       # The further code would be unreliable, so better have this simple fallback.
-      return largest_source
+      return common
     # Ok, there is some other axis (or multiple), or we cannot identify/compare them because of incomplete information.
     # Try something more complex: Make all axes unique.
     # Note that this should also work at template construction time,
     # where we do not have access to the size_placeholder,
     # and thus the dimension tags are not reliable (in the current implementation).
+    tags_dict_ext = {
+      id(tag): [(data, tags_dict[data].index(tag)) for data in sources if tag in tags_dict[data]]
+      for tag in all_dim_tags}
     for dim_tag in all_dim_tags:
       if not dim_tag.can_compare():
         if warnings_out:
@@ -2151,10 +2187,15 @@ class Data(object):
         continue
       if not DimensionTag.get_existing_tag_from_collection(dim_tag, largest_dim_tags, is_equal_opts=is_equal_opts):
         largest_dim_tags.append(dim_tag)
-        largest_source = largest_source.copy_template().copy_add_dim_by_tag(dim_tag, unbroadcast=True)
+        axis = common.get_default_new_axis_for_dim_tag(dim_tag)
+        common = common.copy_template().copy_add_dim_by_tag(dim_tag, unbroadcast=True, axis=axis)
+        if out_shape is not None:
+          tag_data, tag_data_axis = tags_dict_ext[id(dim_tag)][0]
+          assert isinstance(tag_data, Data)
+          out_shape.insert(axis, tag_data.get_dim(tag_data_axis))
     # Simple fallback: Use first with biggest batch_ndim.
     # Was even simpler before: Use first.
-    return largest_source
+    return common
 
 
 _horovod_is_initialized = False
@@ -8549,3 +8590,156 @@ def get_non_deterministic_ops_from_graph():
     # elif ... more non det ops to be added
 
   return non_det_ops
+
+
+def compute_sampled_logits(weights,
+                           biases,
+                           labels,
+                           inputs,
+                           num_sampled,
+                           num_classes,
+                           num_true=1,
+                           sampled_values=None,
+                           subtract_log_q=True,
+                           remove_accidental_hits=False,
+                           partition_strategy="mod",
+                           name=None,
+                           seed=None):
+  """Helper function for nce_loss and sampled_softmax_loss functions.
+  Computes sampled output training logits and labels suitable for implementing
+  e.g. noise-contrastive estimation (see nce_loss) or sampled softmax (see
+  sampled_softmax_loss).
+  Note: In the case where num_true > 1, we assign to each target class
+  the target probability 1 / num_true so that the target probabilities
+  sum to 1 per-example.
+
+  This is a copy of
+    https://github.com/tensorflow/tensorflow/blob/e19c354920c3b246dda6598229210a582caaa1a9/tensorflow/python/ops/nn_impl.py#L1440
+
+  :param tf.Tensor|list[tf.Tensor]|tuple[tf.Tensor] weights: A `Tensor` of shape `[num_classes, dim]`,
+    or a list of `Tensor` objects whose concatenation along dimension 0 has shape `[num_classes, dim]`.
+    The class embeddings.
+  :param tf.Tensor biases: A `Tensor` of shape `[num_classes]`.  The class biases.
+  :param tf.Tensor labels: A `Tensor` of type `int64` and shape `[batch_size, num_true]`.
+    The target classes.  Note that this format differs from
+    the `labels` argument of `tf.nn.softmax_cross_entropy_with_logits`.
+  :param tf.Tensor inputs: A `Tensor` of shape `[batch_size, dim]`.  The forward
+        activations of the input network.
+  :param int num_sampled: The number of classes to randomly sample per batch.
+  :param int num_classes: The number of possible classes.
+  :param int num_true: The number of target classes per training example.
+  :param (tf.Tensor, tf.Tensor, tf.Tensor)|None sampled_values: a tuple of
+    (`sampled_candidates`, `true_expected_count`, `sampled_expected_count`)
+    returned by a `*_candidate_sampler` function.
+    (if None, we default to `log_uniform_candidate_sampler`)
+  :param bool subtract_log_q: whether to subtract the log expected count of
+    the labels in the sample to get the logits of the true labels.
+    Default is True.  Turn off for Negative Sampling.
+  :param bool remove_accidental_hits: Whether to remove "accidental hits"
+    where a sampled class equals one of the target classes.
+  :param str partition_strategy: A string specifying the partitioning strategy, relevant
+    if `len(weights) > 1`. Currently `"div"` and `"mod"` are supported.
+    Default is `"mod"`. See `tf.nn.embedding_lookup` for more details.
+  :param str|None name: A name for the operation.
+  :param int|None seed: random seed for candidate sampling. Default to None, which doesn't set
+    the op-level random seed for candidate sampling.
+  :return:
+    out_logits: `Tensor` object with shape
+        `[batch_size, num_true + num_sampled]`, for passing to either
+        `nn.sigmoid_cross_entropy_with_logits` (NCE) or
+        `nn.softmax_cross_entropy_with_logits` (sampled softmax).
+    out_targets: A Tensor object with the same shape and dtype as `out_logits`.
+      These are the targets. If num_true > 1 the per-example labels are divided by num_true so they sum to 1.0.
+  :rtype: (tf.Tensor, tf.Tensor)
+  """
+
+  if not isinstance(weights, (list, tuple)):
+    weights = [weights]
+
+  with tf.name_scope(name, "compute_sampled_logits",
+                     weights + [biases, inputs, labels]):
+    if labels.dtype != tf.int64:
+      labels = tf.cast(labels, tf.int64)
+    labels_flat = tf.reshape(labels, [-1])
+
+    if sampled_values is None:
+      sampled_values = tf.random.log_uniform_candidate_sampler(
+          true_classes=labels,
+          num_true=num_true,
+          num_sampled=num_sampled,
+          unique=True,
+          range_max=num_classes,
+          seed=seed)
+
+    sampled, true_expected_count, sampled_expected_count = (
+        tf.stop_gradient(s) for s in sampled_values)
+    sampled = tf.cast(sampled, tf.int64)
+
+    all_ids = tf.concat([labels_flat, sampled], 0)
+
+    all_w = tf.nn.embedding_lookup(
+        weights, all_ids, partition_strategy=partition_strategy)
+    if all_w.dtype != inputs.dtype:
+      all_w = tf.cast(all_w, inputs.dtype)
+
+    true_w = tf.slice(all_w,
+                      [0, 0],
+                      [tf.shape(labels_flat)[0], -1])
+
+    sampled_w = tf.slice(
+        all_w, [tf.shape(labels_flat)[0], 0], [-1, -1])
+    sampled_logits = tf.matmul(inputs, sampled_w, transpose_b=True)
+
+    all_b = tf.nn.embedding_lookup(
+        biases, all_ids, partition_strategy=partition_strategy)
+    if all_b.dtype != inputs.dtype:
+      all_b = tf.cast(all_b, inputs.dtype)
+    true_b = tf.slice(all_b, [0], tf.shape(labels_flat))
+    sampled_b = tf.slice(all_b, tf.shape(labels_flat), [-1])
+
+    dim = tf.shape(true_w)[1:2]
+    new_true_w_shape = tf.concat([[-1, num_true], dim], 0)
+    row_wise_dots = tf.multiply(
+        tf.expand_dims(inputs, 1),
+        tf.reshape(true_w, new_true_w_shape))
+    dots_as_matrix = tf.reshape(row_wise_dots,
+                                tf.concat([[-1], dim], 0))
+    true_logits = tf.reshape(tf.reduce_sum(dots_as_matrix, axis=1),
+                             [-1, num_true])
+    true_b = tf.reshape(true_b, [-1, num_true])
+    true_logits += true_b
+    sampled_logits += sampled_b
+
+    if remove_accidental_hits:
+      acc_hits = tf.nn.compute_accidental_hits(
+          labels, sampled, num_true=num_true)
+      acc_indices, acc_ids, acc_weights = acc_hits
+
+      acc_indices_2d = tf.reshape(acc_indices, [-1, 1])
+      acc_ids_2d_int32 = tf.reshape(tf.cast(acc_ids, tf.int32), [-1, 1])
+      sparse_indices = tf.concat([acc_indices_2d, acc_ids_2d_int32], 1,
+                                 "sparse_indices")
+      sampled_logits_shape = tf.concat(
+          [tf.shape(labels)[:1],
+           tf.expand_dims(num_sampled, 0)], 0)
+      if sampled_logits.dtype != acc_weights.dtype:
+        acc_weights = tf.cast(acc_weights, sampled_logits.dtype)
+      sampled_logits += tf.sparse_to_dense(
+          sparse_indices,
+          sampled_logits_shape,
+          acc_weights,
+          default_value=0.0,
+          validate_indices=False)
+
+    if subtract_log_q:
+      true_logits -= tf.log(true_expected_count)
+      sampled_logits -= tf.log(sampled_expected_count)
+
+    out_logits = tf.concat([true_logits, sampled_logits], 1)
+
+    out_targets = tf.concat([
+        tf.ones_like(true_logits) / num_true,
+        tf.zeros_like(sampled_logits)
+    ], 1)
+
+    return out_logits, out_targets
