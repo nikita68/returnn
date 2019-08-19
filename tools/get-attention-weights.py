@@ -331,9 +331,12 @@ def main(argv):
             # Do search for multihead
             # out is [I, H, 1, J] is new version
             # out is [I, J, H, 1] for old version
-            out = np.transpose(out, axes=(0, 3, 1, 2))  # [I, J, H, 1] new version
-            #if len(out.shape) == 3 and out.shape[-1] > 1:
-            out = np.squeeze(out, axis=-1)
+            if len(out.shape) == 3 and min(out.shape) > 1:
+              out = np.transpose(out, axes=(0, 3, 1, 2))  # [I, J, H, 1] new version
+              out = np.squeeze(out, axis=-1)
+            else:
+              out = np.squeeze(out, axis=1)
+            assert out.shape[0] >= output_len[i_beam] and out.shape[1] >= encoder_len[i]
             data[i][l] = out[:output_len[i_beam], :encoder_len[i]]
           fname = args.dump_dir + '/%s_ep%03d_data_%i_%i.npy' % (model_name, rnn.engine.epoch, seq_idx[0], seq_idx[-1])
           np.save(fname, data)
@@ -359,13 +362,13 @@ def main(argv):
               assert l in kwargs
               out = kwargs[l][i]  # []
               # multi-head attention
-              if len(out.shape) == 3 and out.shape[-1] > 1:
+              if len(out.shape) == 3 and min(out.shape) > 1:
                 # Multihead attention
                 out = np.transpose(out, axes=(1, 2, 0))  # (I, J, H) new version
                 #out = np.transpose(out, axes=(2, 0, 1))  # [I, J, H] old version
               else:
                 # RNN
-                out = np.squeeze(out, axis=-1)
+                out = np.squeeze(out, axis=1)
               assert out.ndim >= 2
               assert out.shape[0] >= output_len[i] and out.shape[1] >= encoder_len[i]
               data[i][l] = out[:output_len[i], :encoder_len[i]]

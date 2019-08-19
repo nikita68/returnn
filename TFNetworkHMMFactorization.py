@@ -46,14 +46,14 @@ class HMMFactorization(_ConcatInputLayer):
 
     # Get data
     if in_loop is False:
-      self.attention_weights = attention_weights.output.get_placeholder_as_time_major()  # [J, B, H/1, I]
+      self.attention_weights = attention_weights.output.get_placeholder_as_time_major()  # [J, B, H/1, I]/for rnn: [I, B, H/1, J]
       self.base_encoder_transformed = base_encoder_transformed.output.get_placeholder_as_time_major()  # [J, B, f]
       self.prev_state = prev_state.output.get_placeholder_as_time_major()  # [I, B, f]
       self.prev_outputs = prev_outputs.output.get_placeholder_as_time_major()  # [I, B, f]
       if prev_prev_state:
         self.prev_prev_state = prev_prev_state.output.get_placeholder_as_time_major()  # [I, B, f]
     else:
-      self.attention_weights = attention_weights.output.get_placeholder_as_batch_major()  # [B, H, 1, J]
+      self.attention_weights = attention_weights.output.get_placeholder_as_batch_major()  # [B, (H,) 1, J]
       self.base_encoder_transformed = base_encoder_transformed.output.get_placeholder_as_batch_major()  # [B, J, f]
       self.prev_state = prev_state.output.get_placeholder_as_batch_major()  # [B, intermediate_size]
       self.prev_outputs = prev_outputs.output.get_placeholder_as_batch_major()  # [B, intermediate_size]
@@ -73,7 +73,6 @@ class HMMFactorization(_ConcatInputLayer):
 
     # Transpose and average out attention weights (for when we use transformer architecture)
     if transpose_and_average_att_weights is True:
-
       if in_loop is False:
         # attention_weights is [J, B, H, I]
         self.attention_weights = tf.transpose(self.attention_weights, perm=[3, 0, 1, 2])  # Now it is [I, J, B, H]
@@ -83,19 +82,16 @@ class HMMFactorization(_ConcatInputLayer):
         self.attention_weights = tf.squeeze(self.attention_weights, axis=-2)  # [B, H, J]
         self.attention_weights = tf.reduce_mean(self.attention_weights, keep_dims=True, axis=1)  # [B, 1, J]
         self.attention_weights = tf.transpose(self.attention_weights, perm=[2, 0, 1])  # Now it is [J, B, 1]
-
-      if debug:
-        self.attention_weights = tf.Print(self.attention_weights, [tf.shape(self.attention_weights)],
-                                          message='Attention weight shape after transposing and avg: ', summarize=100)
     else:
       if in_loop is True:
         # Edge case of attention weights
-        self.attention_weights = tf.transpose(self.attention_weights, perm=[1, 0, 2])  # Now [J, B, 1]
-        if debug:
-          self.attention_weights = tf.Print(self.attention_weights, [tf.shape(self.attention_weights)],
-                                            message='Attention weight shape after transposing: ', summarize=100)
+        self.attention_weights = tf.transpose(self.attention_weights, perm=[2, 0, 1])  # Now [J, B, 1]
       else:
-        self.attention_weights = tf.transpose(self.attention_weights, perm=[3, 0, 1, 2])  # [I, J, B, 1]
+        self.attention_weights = tf.transpose(self.attention_weights, perm=[0, 3, 1, 2])  # [I, J, B, 1]
+
+    if debug:
+      self.attention_weights = tf.Print(self.attention_weights, [tf.shape(self.attention_weights)],
+                                        message='Attention weight shape after processing: ', summarize=100)
 
     # top_k management
     assert isinstance(top_k, int) or isinstance(top_k, str), "HMM factorization: top_k of wrong format"
@@ -364,7 +360,7 @@ class HMMFactorization(_ConcatInputLayer):
           temp_attention_weights = tf.where(mask, temp_attention_weights, tf.zeros_like(temp_attention_weights))
           # TODO: should we renormalize?
 
-      top_values, top_indices = tf.nn.top_k(temp_attention_weights, k=top_k) # top_values and indices [(I,) B, 1, top_k]
+      top_values, top_indices = tf.nn.top_k(temp_attention_weights, k=top_k)  # top_values and indices [(I,) B, 1, top_k]
 
       if debug:
         top_indices = tf.Print(top_indices, [top_indices], message="top_indices eg", summarize=20)
@@ -652,8 +648,7 @@ class HMMFactorization(_ConcatInputLayer):
 
   @classmethod
   def transform_config_dict(cls, d, network, get_layer):
-    if "from" not in d:
-      d["from"] = d["prev_state"]
+    d["from"] = d["prev_state"]
     super(HMMFactorization, cls).transform_config_dict(d, network=network, get_layer=get_layer)
     d["attention_weights"] = get_layer(d["attention_weights"])
     d["base_encoder_transformed"] = get_layer(d["base_encoder_transformed"])
