@@ -55,7 +55,7 @@ class HMMFactorization(_ConcatInputLayer):
 
     # Use only top_k from self.attention_weights
     if top_k is not None:
-      top_indices = self._process_topk(window_size, top_k, window_factor)
+      top_indices = self._process_topk(window_size, top_k, window_factor)  # [(I,) B, 1, top_k]
 
     # Get size data
     attention_weights_shape = tf.shape(self.attention_weights)
@@ -124,6 +124,13 @@ class HMMFactorization(_ConcatInputLayer):
       self._add_all_trainable_params(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope.name))
 
   def _process_lexicon_model(self, tie_embedding_weights, n_out):
+    """
+    Process the lexicon model in normal/weight tying case.
+    :param TFNetworkLayer.LayerBase tie_embedding_weights: Layer for weight tying.
+    :param int n_out: Vocab size.
+    :return: tf.Tensor Processed lexicon model of shape [(I,) B, J, vocab_size]
+    """
+
     # Get logits, now [(I,) J, B, vocab_size]
     if tie_embedding_weights is None:
       # When calculating logits directly
@@ -152,6 +159,16 @@ class HMMFactorization(_ConcatInputLayer):
     return lexicon_model
 
   def _process_sampled_softmax(self, sample_use_bias, n_out, base_encoder_transformed, sample_softmax, sample_method):
+    """
+    Process lexicon model in sampled softmax case.
+    :param bool sample_use_bias: Whether to add bias term.
+    :param int n_out: Full vocab size.
+    :param tf.Tensor base_encoder_transformed: Raw encoder states of shape [(I,) J, B, f]
+    :param int sample_softmax: Sample size.
+    :param str sample_method: Sample method, in {"uniform", "log_uniform", "learned_unigram"}
+    :return: tf.Tensor Processed lexicon model of shape [(I,) B, J, vocab_size]
+    """
+
     # [vocab_size, emb]
     lexicon_weight = tf.get_variable("sampled_lexicon_weight", shape=[n_out, base_encoder_transformed.output.shape[-1]])
 
@@ -183,38 +200,47 @@ class HMMFactorization(_ConcatInputLayer):
                                          bias=lexicon_bias,
                                          sample_method=sample_method,
                                          )  # [(I,) B, J, vocab_size]
-    
+
     return lexicon_model
 
   def _post_process_topk(self, top_indices, top_k, batch_size, time_i):
-    if self.in_loop is False:
-      self.base_encoder_transformed = tf.transpose(self.base_encoder_transformed,
-                                                   perm=[0, 2, 1, 3])  # Now [I, B, J, f]
-      top_indices = tf.squeeze(top_indices, axis=2)
-      ii, jj, _ = tf.meshgrid(tf.range(time_i), tf.range(batch_size), tf.range(top_k), indexing='ij')  # [I B k]
+    """
+    Post process operation to extract corresponding encoder states from topK
+    :param tf.Tensor top_indices: From topK, [(I,) B, 1, top_k].
+    :param int top_k: topK size.
+    :param tf.Tensor[int] batch_size: Dynamic batch size.
+    :param tf.Tensor[int] time_i: Dynamic target time size.
+    """
 
+    # Process inputs into correct shapes
+    perm_enc_1 = [1, 0, 2] if self.in_loop else [0, 2, 1, 3]
+    self.base_encoder_transformed = tf.transpose(self.base_encoder_transformed, perm=perm_enc_1)  # Now [(I,) B, J, f]
+    top_indices = tf.squeeze(top_indices, axis=-2)
+
+    # Generate appropriate indices
+    if self.in_loop is False:
+      ii, jj, _ = tf.meshgrid(tf.range(time_i), tf.range(batch_size), tf.range(top_k), indexing='ij')  # [I, B, k]
       # Stack complete index
-      index = tf.stack([ii, jj, top_indices], axis=-1)  # [I B k 3]
-      # index = tf.Print(index, [tf.shape(index)], message='index shape: ', summarize=100)
+      index = tf.stack([ii, jj, top_indices], axis=-1)  # [I, B, k, 3]
     else:
-      self.base_encoder_transformed = tf.transpose(self.base_encoder_transformed,
-                                                   perm=[1, 0, 2])  # Now [B, J, f]
-      top_indices = tf.squeeze(top_indices, axis=1)
       jj, _ = tf.meshgrid(tf.range(batch_size), tf.range(top_k), indexing='ij')
       # Stack complete index
       index = tf.stack([jj, top_indices], axis=-1)
 
-    # Get the same values again
+    # Extract the corresponding encoder data from the topK op
     self.base_encoder_transformed = tf.gather_nd(self.base_encoder_transformed, index)
 
-    if self.in_loop is False:
-      self.base_encoder_transformed = tf.transpose(self.base_encoder_transformed,
-                                                   perm=[0, 2, 1, 3])  # [I, J, B, f]
-    else:
-      self.base_encoder_transformed = tf.transpose(self.base_encoder_transformed,
-                                                   perm=[1, 0, 2])  # [J, B, f]
+    # Transpose into correct shape
+    perm_enc_2 = [1, 0, 2] if self.in_loop else [0, 2, 1, 3]
+    self.base_encoder_transformed = tf.transpose(self.base_encoder_transformed, perm=perm_enc_2)  # [(I,) J, B, f]
 
   def _tile_dependencies(self, time_j, time_i):
+    """
+    Tile the internal states so that they're of correct shapes.
+    :param tf.Tensor[int] time_j: Dynamic source time size.
+    :param tf.Tensor[int] time_i: Dynamic target time size.
+    """
+
     # Convert base_encoder_transformed, prev_state and prev_outputs to correct shape
     if self.in_loop is False:
       self.base_encoder_transformed = tf.tile(tf.expand_dims(self.base_encoder_transformed, axis=0),
@@ -235,11 +261,16 @@ class HMMFactorization(_ConcatInputLayer):
                                   [time_j, 1, 1])  # [J, B, f]
 
   def _process_topk(self, window_size, top_k, window_factor):
-    if self.in_loop is False:
-      temp_attention_weights = tf.transpose(self.attention_weights, perm=[0, 2, 3, 1])  # Now [I, B, 1, J]
-    else:
-      temp_attention_weights = tf.transpose(self.attention_weights, perm=[1, 2, 0])  # Now [B, 1, J]
-    # temp_attention_weights [(I,) B, 1, J]
+    """
+    Extracts the topK most relevant source indices, modifies the attention weights and applies windowing if needed.
+    :param int window_size: Window width, should be even. window_size/2 is the size of window on each side.
+    :param tf.Tensor[int] top_k: K size
+    :param int window_factor: Factor with which target step i is multiplied to center the window on the source side.
+    :return: tf.Tensor The corresponding topK indices of shape [(I,) B, 1, top_k]
+    """
+
+    perm_att_1 = [1, 2, 0] if self.in_loop else [0, 2, 3, 1]
+    temp_attention_weights = tf.transpose(self.attention_weights, perm=perm_att_1)  # Now [(I,) B, 1, J]
 
     if window_size is not None:
       temp_attention_weights = self._process_window(window_size, top_k, temp_attention_weights, window_factor)
@@ -249,10 +280,8 @@ class HMMFactorization(_ConcatInputLayer):
     if self.debug:
       top_indices = tf.Print(top_indices, [top_indices], message="top_indices eg", summarize=20)
 
-    if self.in_loop is False:
-      self.attention_weights = tf.transpose(top_values, perm=[0, 3, 1, 2])  # Now [I, J=top_k, B, 1]
-    else:
-      self.attention_weights = tf.transpose(top_values, perm=[2, 0, 1])  # Now [J=top_k, B, 1]
+    perm_att_2 = [2, 0, 1] if self.in_loop else [0, 3, 1, 2]
+    self.attention_weights = tf.transpose(top_values, perm=perm_att_2)  # Now [I, J=top_k, B, 1]
 
     if self.debug:
       self.attention_weights = tf.Print(self.attention_weights, [tf.shape(self.attention_weights)],
@@ -261,10 +290,16 @@ class HMMFactorization(_ConcatInputLayer):
     return top_indices
 
   def _process_window(self, window_size, top_k, temp_attention_weights, window_factor):
-    # window_size/2 is the size of window on each side. j=i is always seen
+    """
+    Applied a window mask on the attention weights.
+    :param int window_size: Window width, should be even. window_size/2 is the size of window on each side.
+    :param tf.Tensor[int] top_k: K size.
+    :param tf.Tensor temp_attention_weights: The current attention weights [(I,) B, 1, J].
+    :param int window_factor: Factor with which target step i is multiplied to center the window on the source side.
+    :return: tf.Tensor Masked attention weights of shape [(I,) B, 1, J].
+    """
 
     assert window_size % 2 == 0, "HMM Factorization: Window size has to be divisible by 2!"
-
     if isinstance(top_k, int):
       assert top_k <= window_size, "HMM Factorization: top_k can be maximally as large as window_size!"
 
@@ -339,6 +374,7 @@ class HMMFactorization(_ConcatInputLayer):
       # mask is now [B, 1, J], having true only in J where j=i +/- window_size
       # Mask temp_attention_weights to 0
       temp_attention_weights = tf.where(mask, temp_attention_weights, tf.zeros_like(temp_attention_weights))
+
     return temp_attention_weights
 
   def _first_order_processing(self, base_encoder_transformed, first_order_k, first_order_approx, attention_location):
