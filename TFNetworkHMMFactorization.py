@@ -1,9 +1,6 @@
 import tensorflow as tf
-from TFNetworkLayer import _ConcatInputLayer, get_concat_sources_data_template, Loss
-from TFUtil import Data
+from TFNetworkLayer import _ConcatInputLayer, Loss
 import numpy as np
-import time
-import os
 
 
 class HMMFactorization(_ConcatInputLayer):
@@ -39,10 +36,10 @@ class HMMFactorization(_ConcatInputLayer):
 
     super(HMMFactorization, self).__init__(**kwargs)
 
+    # Define basic class instance variables
     self.iteration = 0
     self.batch_iteration = 0
     self.debug = debug
-
     self.in_loop = True if len(prev_state.output.shape) == 1 else False
 
     # Process input so that it is standardized and saved in the class instance
@@ -52,6 +49,7 @@ class HMMFactorization(_ConcatInputLayer):
     # top_k management
     top_k, first_order_k = self._topk_preprocess(top_k, first_order_k)
 
+    # Posterior attention management
     if first_order_alignments is True:
       self._first_order_processing(base_encoder_transformed, first_order_k, first_order_approx, attention_location)
 
@@ -60,18 +58,15 @@ class HMMFactorization(_ConcatInputLayer):
       top_indices = self._process_topk(window_size, top_k, window_factor)
 
     # Get size data
+    attention_weights_shape = tf.shape(self.attention_weights)
     if self.in_loop is False:
-      attention_weights_shape = tf.shape(self.attention_weights)
       time_i = attention_weights_shape[0]
       batch_size = attention_weights_shape[2]
       time_j = attention_weights_shape[1]
-      intermediate_size = tf.shape(self.base_encoder_transformed)[-1]
     else:
-      attention_weights_shape = tf.shape(self.attention_weights)
       batch_size = attention_weights_shape[1]
       time_j = attention_weights_shape[0]
       time_i = None
-      intermediate_size = tf.shape(self.base_encoder_transformed)[-1]
 
     # Convert base_encoder_transformed, prev_state and prev_outputs to correct shape
     self._tile_dependencies(time_j, time_i)
@@ -89,11 +84,8 @@ class HMMFactorization(_ConcatInputLayer):
                                                summarize=100)
 
     # Permute attention weights correctly
-    if self.in_loop is False:
-      self.attention_weights = tf.transpose(self.attention_weights, perm=[0, 2, 3, 1])  # Now [I, B, 1, J]
-    else:
-      # Before [J, B, 1]
-      self.attention_weights = tf.transpose(self.attention_weights, perm=[1, 2, 0])  # Now [B, 1, J]
+    perm_att_weights = [1, 2, 0] if self.in_loop else [0, 2, 3, 1]
+    self.attention_weights = tf.transpose(self.attention_weights, perm=perm_att_weights)  # Now [(I,) B, 1, J]
 
     if self.debug:
       self.attention_weights = tf.Print(self.attention_weights, [tf.shape(self.attention_weights)],
@@ -106,26 +98,20 @@ class HMMFactorization(_ConcatInputLayer):
 
     if sample_softmax:
       lexicon_model = self._process_sampled_softmax(sample_use_bias, n_out, base_encoder_transformed, sample_softmax,
-                                                    sample_method)
+                                                    sample_method)  # [(I,) B, J, vocab_size]
     else:
-      lexicon_model = self._process_lexicon_model(tie_embedding_weights, n_out)
+      lexicon_model = self._process_lexicon_model(tie_embedding_weights, n_out)  # [(I,) B, J, vocab_size]
 
     if self.debug:
       lexicon_model = tf.Print(lexicon_model, [tf.shape(lexicon_model)], message='lexicon_model shape: ', summarize=100)
 
-    # self.in_loop=True   Multiply for final logits, [B, 1, J] x [B, J, vocab_size] ----> [B, 1, vocab]
-    # self.in_loop=False: Multiply for final logits, [I, B, 1, J] x [I, B, J, vocab_size] ----> [I, B, 1, vocab]
+    # Multiply for final logits, [(I,) B, 1, J] x [(I,) B, J, vocab_size] ----> [(I,) B, 1, vocab]
     final_output = tf.matmul(self.attention_weights, lexicon_model)
 
     if self.debug:
       final_output = tf.Print(final_output, [tf.shape(final_output)], message='final_output shape: ', summarize=100)
 
-    if self.in_loop is False:
-      # Squeeze [I, B, vocab]
-      final_output = tf.squeeze(final_output, axis=2)
-    else:
-      # Squeeze [B, vocab]
-      final_output = tf.squeeze(final_output, axis=1)
+    final_output = tf.squeeze(final_output, axis=-2)  # [(I,) B, vocab]
 
     if self.debug:
       final_output = tf.Print(final_output, [tf.shape(final_output)], message='final_output post squeeze shape: ',
@@ -138,13 +124,15 @@ class HMMFactorization(_ConcatInputLayer):
       self._add_all_trainable_params(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope.name))
 
   def _process_lexicon_model(self, tie_embedding_weights, n_out):
-    # Get logits, now [I, J, B, vocab_size]/[J, B, vocab_size]
+    # Get logits, now [(I,) J, B, vocab_size]
     if tie_embedding_weights is None:
+      # When calculating logits directly
       lexicon_logits = tf.layers.dense(self.base_encoder_transformed + self.prev_outputs + self.prev_state,
                                        units=n_out,
                                        activation=None,
                                        use_bias=False)
     else:
+      # When using weight tying
       lexicon_weight = tf.get_default_graph().get_tensor_by_name(
         tie_embedding_weights.get_base_absolute_name_scope_prefix() + "W:0")  # [vocab, emb]
       lexicon_weight = tf.transpose(lexicon_weight, perm=[1, 0])  # [emb, vocab]
@@ -156,12 +144,10 @@ class HMMFactorization(_ConcatInputLayer):
       lexicon_logits = tf.Print(lexicon_logits, [tf.shape(lexicon_logits)], message='Post lex logits shape: ',
                                 summarize=100)
 
-    if self.in_loop is False:
-      lexicon_logits = tf.transpose(lexicon_logits, perm=[0, 2, 1, 3])  # Now [I, B, J, vocab_size]
-    else:
-      lexicon_logits = tf.transpose(lexicon_logits, perm=[1, 0, 2])  # Now [B, J, vocab_size]
+    perm_logits = [1, 0, 2] if self.in_loop else [0, 2, 1, 3]
+    lexicon_logits = tf.transpose(lexicon_logits, perm=perm_logits)  # Now [(I,) B, J, vocab_size]
 
-    # Now [I, B, J, vocab_size]/[B, J, vocab_size], Perform softmax on last layer
+    # Now [(I,) B, J, vocab_size], Perform softmax on last layer
     lexicon_model = tf.nn.softmax(lexicon_logits)
     return lexicon_model
 
@@ -186,7 +172,7 @@ class HMMFactorization(_ConcatInputLayer):
         targets_flat = self._flatten_or_merge(targets,
                                               seq_lens=self.network.extern_data.data['classes'].get_sequence_lengths(),
                                               time_major=False)
-
+    # Input is of shape [(I,) J, B, f]
     lexicon_model = self.sampled_softmax(inp=self.base_encoder_transformed + self.prev_outputs + self.prev_state,
                                          weight=lexicon_weight,
                                          num_samples=sample_softmax,
@@ -197,12 +183,7 @@ class HMMFactorization(_ConcatInputLayer):
                                          bias=lexicon_bias,
                                          sample_method=sample_method,
                                          )  # [(I,) B, J, vocab_size]
-
-    if self.in_loop is False:
-      lexicon_model = tf.transpose(lexicon_model, perm=[0, 2, 1, 3])  # Now [I, B, J, vocab_size]
-    else:
-      lexicon_model = tf.transpose(lexicon_model, perm=[1, 0, 2])  # Now [B, J, vocab_size]
-
+    
     return lexicon_model
 
   def _post_process_topk(self, top_indices, top_k, batch_size, time_i):
@@ -606,7 +587,7 @@ class HMMFactorization(_ConcatInputLayer):
     return out
 
   def sampled_softmax(self, inp, weight, num_samples, full_vocab_size, bias=None, full_softmax=False, sample_method="uniform",
-                      targets=None, targets_flat=None, in_loop=False):
+                      targets=None, targets_flat=None):
 
     if full_softmax:
       # full softmax version
@@ -615,8 +596,9 @@ class HMMFactorization(_ConcatInputLayer):
     else:
       # flatten inp
       weight_shape = tf.shape(weight)  # [vocab_size, emb]
-      input_shape = tf.shape(inp)  # [I, B, k, emb]
-      inp = tf.reshape(inp, shape=[-1, weight_shape[1]])  # [B * I * k, emb]
+      input_shape = tf.shape(inp)  # [I, J=k, B, emb]
+      input_shape = tf.gather(input_shape, [1, 0, 2] if self.in_loop else [0, 2, 1, 3])
+      inp = tf.reshape(inp, shape=[-1, weight_shape[1]])  # [B * I * J, emb]
 
       # get sample
       sampler_dic = {"uniform": tf.nn.uniform_candidate_sampler,
@@ -647,22 +629,21 @@ class HMMFactorization(_ConcatInputLayer):
       if bias is not None:
         bias = tf.nn.embedding_lookup(bias, sampled)
 
-      # [B * I * k, emb] x [emb, num_samples] -> [B * I * k, num_samples]
+      # [B * I * J, emb] x [emb, num_samples] -> [B * I * J, num_samples]
       logits = tf.matmul(inp, weight, transpose_b=True)
-      #logits = tf.einsum("bike,ne->bikn", inp, weight)
       if bias is not None:
         logits += bias
 
       # reshape back
       output_shape = tf.concat([input_shape[:-1], [num_samples]], axis=0)
-      logits = tf.reshape(logits, shape=output_shape)  # [I, B, k, num_samples]
+      logits = tf.reshape(logits, shape=output_shape)  # [I, B, J,  num_samples]
 
       # normalize with softmax
       distribution = tf.nn.softmax(logits, axis=-1)
 
       # project back onto full distribution
 
-      # [I, B, k, num_samples]
+      # [I, B, J, num_samples]
       return distribution
 
   def _add_all_trainable_params(self, tf_vars):
