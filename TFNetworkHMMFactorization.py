@@ -10,28 +10,34 @@ class HMMFactorization(_ConcatInputLayer):
   def __init__(self, attention_weights, base_encoder_transformed, prev_state, prev_outputs, n_out, debug=False,
                attention_location=None, transpose_and_average_att_weights=False, top_k=None,
                window_size=None, first_order_alignments=False, first_order_k=None, window_factor=1.0,
-               tie_embedding_weights=None, prev_prev_state=None, sample_softmax=None, threshold=None,
+               tie_embedding_weights=None, prev_prev_state=None, sample_softmax=None,
                first_order_approx=False, sample_method="uniform", sample_use_bias=False, **kwargs):
     """
-    HMM factorization as described in Parnia Bahar's paper.
-    Out of rnn loop usage.
-    Please refer to the demos to see the layer in use.
-    :param LayerBase attention_weights: Attention weights of shape [I, J, B, 1]
-    :param LayerBase base_encoder_transformed: Encoder, inner most dimension transformed to a constant size
-    'intermediate_size'. Tensor of shape [J, B, intermediate_size]
-    :param LayerBase prev_state: Previous state data, with the innermost dimension set to a constant size
-    'intermediate_size'. Tensor of shape [I, B, intermediate_size].
-    :param LayerBase prev_outputs: Previous output data with the innermost dimension set to a constant size
-    'intermediate_size'. Tensor of shape [I, B, intermediate_size]
-    :param bool debug: True/False, whether to print debug info or not
-    :param float|None threshold: (float, >0), if not set to 'none', all attention values below this threshold will be
-    set to 0. Slightly improves speed.
-    :param bool transpose_and_average_att_weights: Set to True if using Transformer architecture. So, if
-    attention_weights are of shape [J, B, H, I] with H being the amount of heads in the architecture. We will then
-    average out over the heads to get the final attention values used.
-    :param int n_out: Size of output dim (usually not set manually)
-    TODO: documentation
-    :param kwargs:
+    Layer to use attention explicitly in the posterior distribution.
+    :param LayerBase attention_weights: Attention weights layer.
+    :param LayerBase base_encoder_transformed: Encoder layer.
+    :param LayerBase prev_state: Previous (i.e. i-1, so current time-step) decoder state
+    :param LayerBase prev_outputs: Previous embedded output data
+    :param int n_out: Full vocabulary size.
+    :param bool debug: Debug mode.
+    :param str,None attention_location: Posterior attention weight saving.
+    :param bool transpose_and_average_att_weights: Whether to apply appropriate modifications to the attention weights
+    when coming from Transformer (True) or not (False).
+    :param int,str,None top_k: topK setting for optimization. Can be int, or a string which calculates the number
+    dynamically. Look at eval layer for usage examples.
+    :param int window_size: Window width, should be even. window_size/2 is the size of window on each side.
+    :param bool first_order_alignments: Whether to use posterior attention or not.
+    :param bool first_order_approx: Whether to use a mixture of encoder hidden states (True) or as explicit calculation
+    in the posterior (False).
+    :param int,None first_order_k: First order topK optimization. If set to None, then uses top_k setting.
+    :param int window_factor: Factor with which target step i is multiplied to center the window on the source side.
+    :param LayerBase tie_embedding_weights: Layer for weight tying.
+    :param LayerBase prev_prev_state: Layer for (i-2) state.
+    :param int,None sample_softmax: If not None, then uses this number as to sample the softmax. Requires setting
+    "hmm_factorization_sampled_loss" as the loss, and the same sampling setting there.
+    :param str sample_method: Sample method, in {"uniform", "log_uniform", "learned_unigram"}
+    :param bool sample_use_bias: Whether to use a bias term in the sampled softmax (True) or not (False).
+    :param kwargs: kwargs.
     """
 
     super(HMMFactorization, self).__init__(**kwargs)
@@ -378,22 +384,19 @@ class HMMFactorization(_ConcatInputLayer):
     return temp_attention_weights
 
   def _first_order_processing(self, base_encoder_transformed, first_order_k, first_order_approx, attention_location):
+    """
+    Processes the posterior attention modifications.
+    :param tf.Tensor base_encoder_transformed: Raw encoder states of shape [(I,) J, B, f]
+    :param tf.Tensor[int] first_order_k: The posterior attention topK setting.
+    :param bool first_order_approx: Whether to use a mixture of encoder hidden states (True) or as explicit calculation
+    in the posterior (False).
+    :param str attention_location: Used for saving posterior attention weights in debugging.
+    """
+
     # Get shape data
-    if self.in_loop is False:
-      s = tf.shape(self.base_encoder_transformed)
-      time_i = tf.shape(self.prev_state)[0]
-      batch_size = s[1]
-      time_j = s[0]
-      time_j_prime = time_j
-      intermediate_size = s[-1]
-      f = intermediate_size
-    else:
-      s = tf.shape(self.base_encoder_transformed)  # [B, J, f]
-      batch_size = s[0]
-      time_j = s[1]
-      time_j_prime = time_j
-      intermediate_size = s[-1]
-      f = intermediate_size
+    s = tf.shape(self.base_encoder_transformed)
+    batch_size = s[0] if self.in_loop else s[1]
+    time_i = None if self.in_loop else tf.shape(self.prev_state)[0]
 
     # Posterior attention
     prev_prev_output_and_decoder = self.prev_prev_state + self.prev_outputs  # [(I,) B, f]
@@ -421,13 +424,15 @@ class HMMFactorization(_ConcatInputLayer):
       post_attention_topk, post_top_indices = tf.nn.top_k(post_attention_topk, k=first_order_k)  # Both [I, B, 1, top_k]
       post_attention_topk = tf.squeeze(post_attention_topk, axis=-2)  # [I, B, top_k=J']
       post_top_indices = tf.squeeze(post_top_indices, axis=2)  # [I, B, top_k]
-      ii, bb, _ = tf.meshgrid(tf.range(time_i), tf.range(batch_size), tf.range(first_order_k), indexing='ij')  # [I, B, k]
+      ii, bb, _ = tf.meshgrid(tf.range(time_i), tf.range(batch_size), tf.range(first_order_k),
+                              indexing='ij')  # [I, B, k]
       post_indices = tf.stack([ii, bb, post_top_indices], axis=-1)  # [I, B, k, 3]
 
       if self.debug:
         post_indices = tf.Print(post_indices, [post_top_indices], message="post_top_indices", summarize=20)
 
-      encoder_h2 = tf.tile(tf.expand_dims(tf.transpose(encoder_tr, perm=[1, 0, 2]), axis=0), [time_i, 1, 1, 1])  # [I, B, J, f]
+      encoder_h2 = tf.tile(tf.expand_dims(tf.transpose(encoder_tr, perm=[1, 0, 2]), axis=0),
+                           [time_i, 1, 1, 1])  # [I, B, J, f]
       encoder_h2_dir = tf.gather_nd(encoder_h2, post_indices)  # [I, B, top_k=J', f]
       encoder_h2 = tf.expand_dims(encoder_h2_dir, axis=1)  # [I, 1, B, top_k=J', f]
     else:
@@ -438,7 +443,8 @@ class HMMFactorization(_ConcatInputLayer):
       bb, _ = tf.meshgrid(tf.range(batch_size), tf.range(first_order_k), indexing='ij')  # [B, k]
       post_indices = tf.stack([bb, post_top_indices], axis=-1)  # [B, k, 2]
       if self.debug:
-        post_indices = tf.Print(post_indices, [post_indices, post_top_indices], message="post_indices, post_top_indices", summarize=20)
+        post_indices = tf.Print(post_indices, [post_indices, post_top_indices],
+                                message="post_indices, post_top_indices", summarize=20)
       encoder_h2 = tf.transpose(encoder_tr, perm=[1, 0, 2])  # [B, J, f]
       encoder_h2_dir = tf.gather_nd(encoder_h2, post_indices)  # [B, top_k=J', f]
       encoder_h2 = tf.expand_dims(encoder_h2_dir, axis=0)  # [1, B, top_k=J', f]
@@ -472,8 +478,9 @@ class HMMFactorization(_ConcatInputLayer):
       first_order_att = tf.expand_dims(first_order_att, axis=-2)  # [(I,) J, B, 1, f]
       first_order_att = first_order_att + encoder_h2  # [(I,) J, B, top_k=J', f]
       first_order_att = tf.layers.dense(first_order_att, units=base_encoder_transformed.output.shape[-1],
-                                        activation=tf.nn.tanh, use_bias=False)  # TODO: check if this is how we want it
-      first_order_att = tf.layers.dense(first_order_att, units=1, activation=None, use_bias=False)  # [(I,) J, B, top_k=J', 1]
+                                        activation=tf.nn.tanh, use_bias=False)
+      first_order_att = tf.layers.dense(first_order_att, units=1, activation=None,
+                                        use_bias=False)  # [(I,) J, B, top_k=J', 1]
       first_order_att = tf.nn.softmax(first_order_att, axis=-4, name="fo_softmax")  # [(I,) J, B, top_k=J', 1]
       first_order_att = tf.squeeze(first_order_att, axis=-1)  # [(I,) J, B, top_k=J']
 
@@ -489,15 +496,19 @@ class HMMFactorization(_ConcatInputLayer):
 
       if self.debug:
         if self.in_loop:
-          self.attention_weights = tf.Print(self.attention_weights,
-                                            [tf.reduce_sum(tf.transpose(self.attention_weights, perm=[1, 0, 2]), axis=-2)[0],
-                                             tf.transpose(self.attention_weights, perm=[1, 0, 2])[0]], summarize=1000,
-                                            message="self.attention_weights sum and eg")
+          self.attention_weights = \
+            tf.Print(self.attention_weights, [tf.reduce_sum(tf.transpose(self.attention_weights, perm=[1, 0, 2]),
+                                                           axis=-2)[0],
+                     tf.transpose(self.attention_weights, perm=[1, 0, 2])[0]], summarize=1000,
+                     message="self.attention_weights sum and eg")
         else:
-          self.attention_weights = tf.Print(self.attention_weights,
-                                            [tf.reduce_sum(tf.transpose(self.attention_weights, perm=[0, 2, 1, 3]), axis=-2)[0],
-                                             tf.transpose(self.attention_weights, perm=[0, 2, 1, 3])[0, 0]], summarize=1000,
-                                            message="self.attention_weights sum and eg")
+          self.attention_weights = \
+            tf.Print(self.attention_weights,
+                                            [tf.reduce_sum(tf.transpose(self.attention_weights, perm=[0, 2, 1, 3]),
+                                                           axis=-2)[0],
+                                             tf.transpose(self.attention_weights, perm=[0, 2, 1, 3])[0, 0]],
+                     summarize=1000,
+                     message="self.attention_weights sum and eg")
 
       if attention_location is not None:
         if self.in_loop:
@@ -505,7 +516,6 @@ class HMMFactorization(_ConcatInputLayer):
         else:
           i = None
 
-        #self.attention_weights = tf.Print(self.attention_weights, [i, post_top_indices, tf.transpose(self.attention_weights, perm=[1, 0, 2])[0]], summarize=100, message="Attention:")
         if i is not None:
           self.attention_weights = tf.py_func(func=self.save_tensor, inp=[self.attention_weights, attention_location,
                                                                           self.network.global_train_step,
@@ -518,6 +528,13 @@ class HMMFactorization(_ConcatInputLayer):
                                               Tout=tf.float32, stateful=True)
 
   def _topk_preprocess(self, top_k, first_order_k):
+    """
+    Applies preprocessing steps to standardize both the topK and first_order_k operations.
+    :param top_k: topK setting
+    :param first_order_k: Posterior attention topK setting.
+    :return: Modified top_K, first_order_k
+    """
+
     assert isinstance(top_k, int) or isinstance(top_k, str), "HMM factorization: top_k of wrong format"
 
     if first_order_k is None and top_k is not None:
@@ -533,10 +550,7 @@ class HMMFactorization(_ConcatInputLayer):
         top_k = tf.Print(top_k, [top_k], message="Dynamically calculated top k (may be overriden): ")
 
     # max cut top_k
-    if self.in_loop:
-      top_k = tf.minimum(top_k, tf.shape(self.base_encoder_transformed)[1])
-    else:
-      top_k = tf.minimum(top_k, tf.shape(self.base_encoder_transformed)[0])
+    top_k = tf.minimum(top_k, tf.shape(self.base_encoder_transformed)[1 if self.in_loop else 0])
 
     # if we want dynamic top_k
     if isinstance(first_order_k, str):
@@ -549,17 +563,26 @@ class HMMFactorization(_ConcatInputLayer):
                                  message="Dynamically calculated top k (may be overriden): ")
 
     # max cut top_k
-    if self.in_loop:
-      first_order_k = tf.minimum(first_order_k, tf.shape(self.base_encoder_transformed)[1])
-    else:
-      first_order_k = tf.minimum(first_order_k, tf.shape(self.base_encoder_transformed)[0])
+    first_order_k = tf.minimum(first_order_k, tf.shape(self.base_encoder_transformed)[1 if self.in_loop else 0])
+
     return top_k, first_order_k
 
   def _process_input(self, attention_weights, base_encoder_transformed, prev_state, prev_outputs, prev_prev_state,
                      transpose_and_average_att_weights):
+    """
+    Processes the input data to be of correct format.
+    :param TFNetworkLayer.LayerBase attention_weights: Attention weights layer.
+    :param TFNetworkLayer.LayerBase base_encoder_transformed:  Encoder layer.
+    :param TFNetworkLayer.LayerBase prev_state: Previous (current, i-1) states layer.
+    :param TFNetworkLayer.LayerBase prev_outputs: Previous outputs layer.
+    :param TFNetworkLayer.LayerBase prev_prev_state: i-2 states layer
+    :param bool transpose_and_average_att_weights: Whether to apply averaging for Transformer.
+    """
+
     # Get data
     if self.in_loop is False:
-      self.attention_weights = attention_weights.output.get_placeholder_as_time_major()  # [J, B, H/1, I]/for rnn: [I, B, H/1, J]
+      self.attention_weights = \
+        attention_weights.output.get_placeholder_as_time_major()  # [J, B, H/1, I]/for rnn: [I, B, H/1, J]
       self.base_encoder_transformed = base_encoder_transformed.output.get_placeholder_as_time_major()  # [J, B, f]
       self.prev_state = prev_state.output.get_placeholder_as_time_major()  # [I, B, f]
       self.prev_outputs = prev_outputs.output.get_placeholder_as_time_major()  # [I, B, f]
@@ -607,6 +630,16 @@ class HMMFactorization(_ConcatInputLayer):
                                         message='Attention weight shape after processing: ', summarize=100)
 
   def linear(self, x, units, inp_dim=None, weight=None, bias=False):
+    """
+    An optimized GPU linear layer.
+    :param tf.Tensor x: Input
+    :param int units: Output feature dim.
+    :param int inp_dim: If weight not provided, then the input dimension
+    :param tf.Tensor weight: If set, then use this weight to multiply, else will generate custom trainable weight.
+    :param bool,tf.Tensor bias: Provide a tensor to use as bias or set to true for auto generated trainable bias.
+    :return: Output tensor.
+    """
+
     in_shape = tf.shape(x)
     inp = tf.reshape(x, [-1, in_shape[-1]])
     if weight is None:
@@ -619,16 +652,29 @@ class HMMFactorization(_ConcatInputLayer):
       out = out + bias
     out_shape = tf.concat([in_shape[:-1], [units]], axis=0)
     out = tf.reshape(out, out_shape)
-    # TODO: maybe use tensordot instead
     return out
 
   def sampled_softmax(self, inp, weight, num_samples, full_vocab_size, bias=None, full_softmax=False, sample_method="uniform",
                       targets=None, targets_flat=None):
+    """
+    Applies sampled softmax.
+    :param tf.Tensor inp: Input tensors.
+    :param tf.Tensor weight: Weight matrix of output layer.
+    :param int num_samples: Number of samples to select.
+    :param int full_vocab_size: Full vocab size.
+    :param tf.Tensor bias: Bias tensor to use.
+    :param bool full_softmax: Whether to compute the full softmax (True), or to use samples approach (False)
+    :param str sample_method: Sample method, in {"uniform", "log_uniform", "learned_unigram"}
+    :param tf.Tensor targets: Tensor containing target indices.
+    :param tf.Tensor targets_flat: Targets correctly flattened out.
+    :return: Appropriate posterior, of shape [I, B, J, num_samples].
+    """
 
     if full_softmax:
       # full softmax version
       logits = self.linear(x=inp, units=full_vocab_size, weight=tf.transpose(weight, perm=[1, 0]), bias=bias)
-      return tf.nn.softmax(logits, axis=-1)
+      posterior = tf.nn.softmax(logits, axis=-1)
+      return tf.transpose(posterior, perm=[1, 0, 2] if self.in_loop else [0, 2, 1, 3])
     else:
       # flatten inp
       weight_shape = tf.shape(weight)  # [vocab_size, emb]
@@ -677,17 +723,21 @@ class HMMFactorization(_ConcatInputLayer):
       # normalize with softmax
       distribution = tf.nn.softmax(logits, axis=-1)
 
-      # project back onto full distribution
-
       # [I, B, J, num_samples]
       return distribution
 
   def _add_all_trainable_params(self, tf_vars):
+    """
+    Adds all trainable tensorflow variables to save.
+    :param list[tf.Variable] tf_vars: Variables to save.
+    :return:
+    """
     for var in tf_vars:
       self.add_param(param=var, trainable=True, saveable=True)
 
   def _flatten_or_merge(self, x, seq_lens, time_major):
     """
+    Copy of the function from Loss
     :param tf.Tensor x: (B,T,...) or (T,B,...)
     :param tf.Tensor seq_lens: (B,)
     :param bool time_major:
@@ -700,6 +750,9 @@ class HMMFactorization(_ConcatInputLayer):
   @classmethod
   def transform_config_dict(cls, d, network, get_layer):
     d["from"] = d["prev_state"]
+    if "threshold" in d:
+      del d["threshold"]
+
     super(HMMFactorization, cls).transform_config_dict(d, network=network, get_layer=get_layer)
     d["attention_weights"] = get_layer(d["attention_weights"])
     d["base_encoder_transformed"] = get_layer(d["base_encoder_transformed"])
@@ -711,24 +764,32 @@ class HMMFactorization(_ConcatInputLayer):
       d["tie_embedding_weights"] = get_layer(d["tie_embedding_weights"])
 
   def save_tensor(self, attention_tensor, location, global_train_step, posterior_attention=None, i_step=None):
-      # save tensor to file location
-      d = {}
-      d["i_step"] = i_step
-      d["global_train_step"] = global_train_step
-      d["shape"] = attention_tensor.shape
-      d["attention_tensor"] = attention_tensor
-      d["posterior_attention"] = posterior_attention
+    """
+    Hacky way to save tensor.
+    :param attention_tensor: Attention tensor.
+    :param location: Location to save.
+    :param global_train_step: Global training save.
+    :param posterior_attention: Posterior attention tensor.
+    :param i_step: Current sub step, can be None.
+    """
+    # save tensor to file location
+    d = {}
+    d["i_step"] = i_step
+    d["global_train_step"] = global_train_step
+    d["shape"] = attention_tensor.shape
+    d["attention_tensor"] = attention_tensor
+    d["posterior_attention"] = posterior_attention
 
-      if i_step is not None:
-        if i_step == 0:
-          self.batch_iteration += 1
-      else:
+    if i_step is not None:
+      if i_step == 0:
         self.batch_iteration += 1
+    else:
+      self.batch_iteration += 1
 
-      np.save(str(location.decode("utf-8")) + '/' + str(self.batch_iteration) + "_" + str(i_step) +'_attention.npy', d)
+    np.save(str(location.decode("utf-8")) + '/' + str(self.batch_iteration) + "_" + str(i_step) +'_attention.npy', d)
 
-      self.iteration += 1
-      return attention_tensor
+    self.iteration += 1
+    return attention_tensor
 
 
 class HMMFactorizationSampledSoftmaxLoss(Loss):
