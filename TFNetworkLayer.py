@@ -8670,10 +8670,11 @@ def _init_layer_class_dict():
   import TFNetworkSegModLayer
   import TFNetworkNeuralTransducer
   import TFNetworkHMMFactorization
+  import TFNetworkTopicFactorization
 
   auto_register_layer_classes(list(globals().values()))
   for mod in [TFNetworkRecLayer, TFNetworkSigProcLayer, TFNetworkSegModLayer, TFNetworkNeuralTransducer,
-              TFNetworkHMMFactorization]:
+              TFNetworkHMMFactorization, TFNetworkTopicFactorization]:
     auto_register_layer_classes(list(vars(mod).values()))
 
   for alias, v in {"forward": LinearLayer, "hidden": LinearLayer}.items():
