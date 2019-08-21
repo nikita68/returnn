@@ -456,6 +456,13 @@ class LayerBase(object):
             # Also, if we are inside a rec layer, and doing search, we also cannot do that.
             if not network.is_inside_rec_layer() or not network.search_flag:
               network.used_data_keys.add(target)
+    # support that the initial_output of any layer inside a recurrent unit can be a layer from base
+    if d.get("initial_output", None):
+      initial_output = d["initial_output"]
+      if isinstance(initial_output, str):
+        if initial_output not in ["zeros", "ones", "var", "keep_over_epoch", "keep_over_epoch_no_init", "apply(0)"]:
+          # if initial_output is not a reserverd keyword, assume it is a layer
+          d['initial_output'] = get_layer(initial_output)
     if "n_out" not in d and targets and network.eval_flag:
       # Must be done here now because loss might be set to None later.
       target = targets[0]  # guess using first target
@@ -1191,6 +1198,8 @@ class LayerBase(object):
       with tf.name_scope("init_%s_const" % name):
         from TFUtil import constant_with_shape
         return tf.cast(constant_with_shape(v, shape=shape), dtype=data.dtype)
+    if isinstance(v, LayerBase):
+      return v.output.placeholder
     assert isinstance(v, str)
     if v == "zeros":
       return tf.zeros(shape, dtype=data.dtype, name="init_%s_zeros" % name)
@@ -1826,7 +1835,7 @@ def get_concat_sources_data_template(src_layers, name=None):
     beam_size = beam_size or layer.output.beam_size
   shape = list(common_source.shape)
   shape[common_source.get_batch_axis_excluding_batch(common_source.feature_dim_axis)] = dim
-  kwargs = common_source.get_kwargs()
+  kwargs = common_source.get_kwargs(with_size_placeholder=True)
   kwargs.update(dict(
     name=name or ("concat_" + "_".join([l.name for l in src_layers])),
     shape=shape,
@@ -3082,19 +3091,35 @@ class ConstantLayer(LayerBase):
   """
   layer_class = "constant"
 
-  def __init__(self, sources, value=0, dtype=None, **kwargs):
+  # noinspection PyUnusedLocal
+  def __init__(self, sources, value=0., dtype=None, **kwargs):
+    """
+    :param list[LayerBase] sources:
+    :param int|float|bool value:
+    :param str|None dtype:
+    """
     assert not sources, "constant layer cannot have sources"
     super(ConstantLayer, self).__init__(**kwargs)
     # Add batch-dim to the constant.
-    self.output.placeholder = tf.expand_dims(tf.constant(value, dtype=dtype), axis=0)
+    self.output.placeholder = tf.expand_dims(tf.constant(value, dtype=self.output.dtype), axis=0)
 
   @classmethod
-  def get_out_data_from_opts(cls, name, dtype="float32", **kwargs):
+  def get_out_data_from_opts(cls, name, value=0., dtype=None, **kwargs):
     """
     :param str name:
-    :param str dtype:
+    :param int|float|bool value:
+    :param str|None dtype:
     :rtype: Data
     """
+    if dtype is None:
+      if isinstance(value, int):
+        dtype = "int32"
+      elif isinstance(value, float):
+        dtype = "float32"
+      elif isinstance(value, bool):
+        dtype = "bool"
+      else:
+        raise TypeError("cannot handle value %r of type %r" % (value, type(value)))
     return Data(
       name="%s_const" % name, shape=(), batch_dim_axis=0, time_dim_axis=None, dtype=dtype)
 
@@ -4154,6 +4179,8 @@ class ConvLayer(_ConcatInputLayer):
       :param int|tf.Tensor|T b:
       :rtype: T
       """
+      if isinstance(b, int) and b == 1:
+        return a
       return -(-a // b)
 
     padding = padding.upper()
@@ -4287,10 +4314,11 @@ class PoolLayer(_ConcatInputLayer):
         in_dim=self.output.size_placeholder[i],
         filter_size=pool_size[i - index_shift], stride=strides[i - index_shift],
         dilation_rate=dilation_rate[i - index_shift], padding=padding)
-      tag = DimensionTag(
-        description="spatial:%i:%s" % (i, self.get_absolute_name()),
-        kind=DimensionTag.Types.Spatial)
-      tag.set_tag_on_size_tensor(self.output.size_placeholder[i])
+      if DimensionTag.get_tag_from_size_tensor(self.output.size_placeholder[i]) is None:
+        tag = DimensionTag(
+          description="spatial:%i:%s" % (i, self.get_absolute_name()),
+          kind=DimensionTag.Types.Spatial)
+        tag.set_tag_on_size_tensor(self.output.size_placeholder[i])
 
   @classmethod
   def get_out_data_from_opts(cls, name, pool_size, strides=None, dilation_rate=1, sources=(), padding="VALID",
@@ -5623,7 +5651,7 @@ class CombineLayer(LayerBase):
       if isinstance(sources[i], LayerBase):
         output = sources[i].output
         if auto_convert:
-          output = output.copy_compatible_to(self.output, check_dtype=False)
+          output = output.copy_compatible_to(self.output, check_dtype=False, check_sparse=False)
         if enforce_batch_major:
           output = output.copy_as_batch_major()
         if as_data:
@@ -6615,42 +6643,48 @@ class HDFDumpLayer(LayerBase):
   """
   layer_class = "hdf_dump"
 
-  def __init__(self, filename, dump_whole_batches=False, **kwargs):
+  def __init__(self, filename, extra=None, dump_whole_batches=False, **kwargs):
     """
     :param str filename:
+    :param None|dict[str,LayerBase] extra:
     :param bool dump_whole_batches: dumps the whole batch as a single sequence into the HDF
     """
     super(HDFDumpLayer, self).__init__(**kwargs)
     assert len(self.sources) == 1
     assert self.sources[0].output.have_time_axis()
     self.output = self.sources[0].output.copy("%s_output" % self.name)
-    data = self.output.copy_as_batch_major()  # need batch-major for SimpleHDFWriter
+    data = self.output.copy_as_batch_spatial_major()  # need batch-major for SimpleHDFWriter
 
+    from TFUtil import register_graph_reset_callback
     from HDFDataset import SimpleHDFWriter
-    import atexit
     import numpy
     import sys
     self.filename = filename
+    if extra is None:
+      extra = {}
+    extra = {key: layer.output.copy_as_batch_spatial_major() for (key, layer) in extra.items()}
+    self.extra = extra  # type: typing.Dict[str,Data]
     self.dump_whole_batches = dump_whole_batches
     self.num_seqs_written = 0
     ndim = data.ndim
     if dump_whole_batches:
       ndim = data.ndim - len(data.size_placeholder) + 1
-    data_dim = None if data.sparse else data.dim
-    ndim_without_features = ndim - (1 if data_dim else 0)
-    self.hdf_writer = SimpleHDFWriter(filename=filename, dim=data_dim, ndim=ndim)
-    atexit.register(self._at_exit)
+    ndim_without_features = ndim - (0 if data.sparse else 1)
+    self.hdf_writer = SimpleHDFWriter(filename=filename, dim=data.dim, ndim=ndim)
+    register_graph_reset_callback(self._at_graph_reset)
 
-    def py_write(data_np, tags, *sizes):
+    def py_write(data_np, tags, sizes, *extras):
       """
       :param numpy.ndarray data_np: (B,...), this is data.placeholder
       :param list[bytes] tags:
-      :param sizes:
+      :param numpy.ndarray sizes: shape [num_sizes,size_placeholder[i]]
+      :param numpy.ndarray extras:
       :return: unused
       """
       # noinspection PyBroadException
       try:
         n_batch = data_np.shape[0]
+        assert sizes.shape == (len(data.size_placeholder), n_batch)
         assert len(sizes) == len(data.size_placeholder)
         seq_lens = {i: size for (i, size) in zip(sorted(data.size_placeholder.keys()), sizes)}
         # There may be axes with a fixed length other than the batch and feature axes.
@@ -6659,7 +6693,8 @@ class HDFDumpLayer(LayerBase):
           if dim not in seq_lens:
             seq_lens[dim] = numpy.array([data_np.shape[dim + 1]] * n_batch, dtype="int32")
         assert len(seq_lens) == ndim_without_features
-        extra = {}
+        assert len(extras) == len(self.extra)
+        extra = {key: value for (key, value) in zip(sorted(self.extra.keys()), extras)}
         if self.dump_whole_batches:
           # The batch dim itself becomes another axis to dump.
           # We also want to store the individual seq lens.
@@ -6673,6 +6708,7 @@ class HDFDumpLayer(LayerBase):
           seq_lens = {0: numpy.array([flat_len], dtype="int32")}
           tags = [b"<->".join(tags)]
           n_batch = 1
+
         assert n_batch == data_np.shape[0] == len(tags)
         self.num_seqs_written += n_batch
         self.hdf_writer.insert_batch(inputs=data_np, seq_tag=tags, seq_len=seq_lens, extra=extra)
@@ -6684,13 +6720,15 @@ class HDFDumpLayer(LayerBase):
 
     tf_write = tf.py_func(
       py_write,
-      [data.placeholder, self.network.get_seq_tags()] + [size for (i, size) in sorted(data.size_placeholder.items())],
-      tf.int64,
+      [data.placeholder, self.network.get_seq_tags(),
+       tf.convert_to_tensor([size for (i, size) in sorted(data.size_placeholder.items())])] +
+      [value.placeholder for (key, value) in sorted(extra.items())],
+      tf.int64,  # return value is ignored
       stateful=True)
 
     self.network.register_post_control_dependencies([tf_write])
 
-  def _at_exit(self):
+  def _at_graph_reset(self):
     print("HDFDumpLayer, wrote %i seqs to file %r." % (self.num_seqs_written, self.filename))
     self.hdf_writer.close()
 
@@ -6701,8 +6739,21 @@ class HDFDumpLayer(LayerBase):
     :param list[LayerBase] sources:
     :rtype: Data
     """
-    assert len(sources) == 1, "PrintLayer %r: expects exactly one source, but got: %r" % (name, sources)
-    return sources[0].output.copy("%s_output" % name)
+    assert len(sources) == 1, "%s %r: expects exactly one source, but got: %r" % (cls.__name__, name, sources)
+    return sources[0].output.copy(name="%s_output" % name)
+
+  @classmethod
+  def transform_config_dict(cls, d, network, get_layer):
+    """
+    :param dict[str] d: will modify inplace
+    :param TFNetwork.TFNetwork network:
+    :param ((str) -> LayerBase) get_layer: function to get or construct another layer
+    """
+    super(HDFDumpLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
+    if d.get("extra", None):
+      extra = d["extra"]
+      assert isinstance(extra, dict), "invalid in %r" % d
+      d["extra"] = {key: get_layer(value) for (key, value) in extra.items()}
 
 
 class ImageSummaryLayer(LayerBase):

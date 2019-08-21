@@ -678,10 +678,7 @@ class Engine(EngineBase):
     Finalizes the TF session, network, graph.
     """
     self._close_tf_session()
-    tf.reset_default_graph()
-    self.network = None
-    self.updater = None
-    self._merge_all_summaries = None
+    self._reset_graph()
 
   def get_const_tensor(self, key, value):
     """
@@ -756,10 +753,14 @@ class Engine(EngineBase):
     Resets the default graph (of the current thread),
     and clears up any cached tensors created in it.
     """
+    from TFUtil import call_graph_reset_callbacks
+    call_graph_reset_callbacks()
     tf.reset_default_graph()
     self._checked_uninitialized_vars = False
     self._merge_all_summaries = None
     self._const_cache.clear()
+    self.network = None
+    self.updater = None
 
   def get_eval_datasets(self):
     """
@@ -948,6 +949,8 @@ class Engine(EngineBase):
     :param dict[str,dict[str]] net_desc:
     :param int epoch:
     """
+    updated_datasets = {}  # type: typing.Dict[str,Dataset]
+
     # noinspection PyShadowingNames
     def set_value(key, value):
       """
@@ -968,16 +971,25 @@ class Engine(EngineBase):
         # To be sure, never keep the batch order.
         self.dataset_batches.clear()
         setattr(self, key, value)
+      if key in ["train", "dev", "eval"]:
+        self.dataset_batches.pop(key, None)
+        from Dataset import init_dataset
+        dataset_kwargs = {"name": key}
+        if key != "train":
+          dataset_kwargs.update(Dataset.get_default_kwargs_eval(config=self.config))
+        Dataset.kwargs_update_from_config(config=self.config, kwargs=dataset_kwargs)
+        dataset = init_dataset(value, default_kwargs=dataset_kwargs)
+        assert hasattr(self, "%s_data" % key)
+        setattr(self, "%s_data" % key, dataset)
+        updated_datasets[key] = dataset
 
     if self.orig_config:
       # We have updated the config before. Now, first, recover all entries.
       for key, value in self.orig_config.items():
         set_value(key, value)
       self.orig_config.clear()
-    if "#config" not in net_desc:
-      return
 
-    config_overwrites = net_desc["#config"]
+    config_overwrites = net_desc.get("#config", {})
     for key, value in config_overwrites.items():
       if key == "learning_rate":
         if not self.learning_rate_control:
@@ -995,6 +1007,9 @@ class Engine(EngineBase):
       self.orig_config[key] = orig_value
       set_value(key, value)
 
+    for dataset in updated_datasets.values():
+      dataset.init_seq_order(epoch=self.epoch)
+
   def _init_network(self, net_desc, epoch=None):
     """
     :param dict[str,dict[str]] net_desc: layer name -> layer description dict
@@ -1004,7 +1019,6 @@ class Engine(EngineBase):
       epoch = self.epoch
     self._close_tf_session()
     self._reset_graph()
-    self._maybe_update_config(net_desc=net_desc, epoch=epoch)
     # The new session will by default use the newly created default graph.
     self._make_tf_session()
     tf_random_seed = 42
@@ -1173,6 +1187,9 @@ class Engine(EngineBase):
       # Note: For pretrain epochs, we ensure that the last pretrain epoch will have exactly the same
       # network as we use after pretraining.
       new_network_desc = self.pretrain.get_network_json_for_epoch(self.epoch)
+      # Always update config, if needed, even if nothing changed.
+      # This might trigger enforcing some learning rate, or so.
+      self._maybe_update_config(net_desc=new_network_desc, epoch=self.epoch)
       self.maybe_init_new_network(new_network_desc)
       self.network.declare_train_params(**self.pretrain.get_train_param_args_for_epoch(self.epoch))
     if self.config.is_true("use_learning_rate_control_always"):
@@ -1387,9 +1404,9 @@ class Engine(EngineBase):
       if "error" in output_per_seq_format:
         extra_fetches["error"] = loss_holder.get_normalized_error_value_per_seq()
       if "pos_score" in output_per_seq_format:
-        extra_fetches["pos_score"] = loss_holder.get_normalized_loss_value_per_seq(per_pos=True)
+        extra_fetches["pos_score"] = loss_holder.get_loss_value_per_pos()
       if "pos_error" in output_per_seq_format:
-        extra_fetches["pos_error"] = loss_holder.get_normalized_error_value_per_seq(per_pos=True)
+        extra_fetches["pos_error"] = loss_holder.get_error_value_per_pos()
 
     seq_idx_to_tag = {}  # type: typing.Dict[int,str]  # we need this in order to write the results in the correct order later  # nopep8
     results_per_seq = {}  # type: typing.Dict[str,typing.Dict[str,typing.Union[float,str,int]]]  # seq_tag -> dict. Results of fetches will be written in this dict  # nopep8

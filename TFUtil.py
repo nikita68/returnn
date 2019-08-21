@@ -24,6 +24,7 @@ class CollectionKeys:
   RETURNN_LAYERS = "_RETURNN_layers"  # LayerBase instances
   RETURNN_NET_STACK = "_RETURNN_network_stack"  # TFNetwork instance stack
   STATE_VARS = "_RETURNN_state_vars"  # tf.Variable, like e.g. tf.GraphKeys.LOCAL_VARIABLES
+  GRAPH_RESET_CALLBACKS = "_RETURNN_graph_reset_callbacks"
 
 
 def tf_version_tuple():
@@ -471,6 +472,7 @@ class Data(object):
         "%s: inconsistent dim. feature axis or unspecified: %r." % (self, self.feature_dim_axis_or_unspecified))
     if not ignore_placeholder and self.placeholder is not None:
       self.placeholder.set_shape(self.batch_shape)
+      assert self.placeholder.dtype.base_dtype.name == self.dtype
 
   def get_placeholder_kwargs(self, with_batch=True):
     """
@@ -1112,11 +1114,13 @@ class Data(object):
         return data
       assert data.beam_size is None, "incompatible beam sizes (%r vs %r)" % (data.beam_size, beam_size)
       if data.placeholder is not None:
-        data.placeholder = tile_transposed(data.placeholder, axis=data.batch_dim_axis, multiples=dyn_beam_size)
+        with same_control_flow_ctx(data.placeholder):
+          data.placeholder = tile_transposed(data.placeholder, axis=data.batch_dim_axis, multiples=dyn_beam_size)
       if data.size_placeholder is not None:
         for i, v in sorted(data.size_placeholder.items()):
           tag = DimensionTag.get_tag_from_size_tensor(v)
-          data.size_placeholder[i] = tile_transposed(v, axis=0, multiples=dyn_beam_size)
+          with same_control_flow_ctx(v):
+            data.size_placeholder[i] = tile_transposed(v, axis=0, multiples=dyn_beam_size)
           if tag is not None:
             tag.set_tag_on_size_tensor(data.size_placeholder[i])
       data.beam_size = beam_size * (data.beam_size or 1)
@@ -1162,15 +1166,18 @@ class Data(object):
     data.sanity_check()
     return data
 
-  def copy_template(self, name=None):
+  def copy_template(self, name=None, dtype=None):
     """
     :param str|None name:
+    :param str|None dtype:
     :return: copy of myself, using self.get_kwargs(), without placeholder
     :rtype: Data
     """
     kwargs = self.get_kwargs(with_size_placeholder=True)
     if name:
       kwargs["name"] = name
+    if dtype:
+      kwargs["dtype"] = dtype
     return Data(**kwargs)
 
   def copy_template_excluding_spatial_dim(self, spatial_axis_num, name=None):
@@ -8743,3 +8750,21 @@ def compute_sampled_logits(weights,
     ], 1)
 
     return out_logits, out_targets
+
+
+def register_graph_reset_callback(cb):
+  """
+  Note: These callbacks are not called automatically.
+  You explicitly have to call :func:`call_graph_reset_callbacks`.
+
+  :param function cb:
+  """
+  tf.get_collection_ref(CollectionKeys.GRAPH_RESET_CALLBACKS).append(cb)
+
+
+def call_graph_reset_callbacks():
+  """
+  Calls any callbacks registered via :func:`register_graph_reset_callback`.
+  """
+  for cb in tf.get_collection(CollectionKeys.GRAPH_RESET_CALLBACKS):
+    cb()

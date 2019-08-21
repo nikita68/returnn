@@ -87,6 +87,7 @@ class RecLayer(_ConcatInputLayer):
                cheating=False,
                unroll=False, back_prop=None,
                use_global_rec_step_offset=False,
+               debug=None,
                **kwargs):
     """
     :param str|dict[str,dict[str]] unit: the RNNCell/etc name, e.g. "nativelstm". see comment below.
@@ -105,6 +106,7 @@ class RecLayer(_ConcatInputLayer):
     :param bool unroll: if possible, unroll the loop (implementation detail)
     :param bool|None back_prop: for tf.while_loop. the default will use self.network.train_flag
     :param bool use_global_rec_step_offset:
+    :param bool|None debug:
     """
     super(RecLayer, self).__init__(**kwargs)
     import re
@@ -134,6 +136,9 @@ class RecLayer(_ConcatInputLayer):
       back_prop = self.network.train_flag is not False
     self.back_prop = back_prop
     self._use_global_rec_step_offset = use_global_rec_step_offset
+    if debug is None:
+      debug = self.network.get_config().bool("debug_rec_layer", False)
+    self.debug = debug
     # On the random initialization:
     # For many cells, e.g. NativeLSTM: there will be a single recurrent weight matrix, (output.dim, output.dim * 4),
     # and a single input weight matrix (input_data.dim, output.dim * 4), and a single bias (output.dim * 4,).
@@ -1736,7 +1741,7 @@ class _SubnetworkRecCell(object):
             collected_choices += [layer.name]
 
             # noinspection PyShadowingNames
-            def get_derived(name):
+            def get_choices_getter(name):
               """
               :param str name:
               :rtype: ()->tf.Tensor|None
@@ -1754,7 +1759,36 @@ class _SubnetworkRecCell(object):
                 name="choice_%s" % layer.name,
                 dtype=tf.int32,
                 element_shape=(None, layer.search_choices.beam_size),  # (batch, beam)
-                get=get_derived(layer.name)))
+                get=get_choices_getter(layer.name)))
+
+            if rec_layer.debug:
+              # noinspection PyShadowingNames
+              def get_choices_scores_getter(name):
+                """
+                :param str name:
+                :rtype: ()->tf.Tensor|None
+                """
+                def get_beam_scores():
+                  """
+                  :rtype: tf.Tensor|None
+                  """
+                  layer = self.net.layers[name]
+                  return layer.search_choices.beam_scores
+
+                return get_beam_scores
+
+              outputs_to_accumulate.append(
+                _SubnetworkRecCell.OutputToAccumulate(
+                  name="debug_search_scores_%s" % layer.name,
+                  dtype=tf.float32,
+                  element_shape=(None, layer.search_choices.beam_size),  # (batch, beam)
+                  get=get_choices_scores_getter(layer.name)))
+              outputs_to_accumulate.append(
+                _SubnetworkRecCell.OutputToAccumulate(
+                  name="debug_search_choices_%s" % layer.name,
+                  dtype=tf.float32,
+                  element_shape=(None, layer.search_choices.beam_size),  # (batch, beam)
+                  get=get_choices_getter(layer.name)))
 
         if collected_choices:
           output_beam_size = self.layer_data_templates["output"].get_search_beam_size()
@@ -1847,6 +1881,14 @@ class _SubnetworkRecCell(object):
       for name in extra_output_layers:
         if name in self.layers_in_loop:
           add_output_to_acc(name)
+
+      if rec_layer.debug:
+        if layer_name in self.layers_in_loop:
+          outputs_to_accumulate.append(_SubnetworkRecCell.OutputToAccumulate(
+            name="debug_output_%s" % layer_name,
+            dtype=self.layer_data_templates[layer_name].output.dtype,
+            element_shape=self.layer_data_templates[layer_name].output.batch_shape,
+            get=lambda name_=layer_name: self.net.get_layer(name_).output.placeholder))
 
       # Maybe some of the moved-out output-layers depend on data inside the loop,
       # so we should accumulate it to have access to it.
@@ -3886,6 +3928,7 @@ class ChoiceLayer(LayerBase):
           gold_labels_bc = tf.expand_dims(gold_labels, axis=1)  # (batch,1)
           labels = tf.concat([labels[:, :beam_size - 1], gold_labels_bc], axis=1)  # (batch,beam)
           from TFUtil import nd_indices
+          # Note: In case the seq ended, we assume that the gold_targets are all 0, such that we get the right score.
           gold_scores = tf.gather_nd(
             scores_comb[:, gold_beam_in_idx], indices=nd_indices(gold_targets))  # (batch,)
           gold_scores_bc = tf.expand_dims(gold_scores, axis=1)  # (batch,1)
@@ -4003,13 +4046,25 @@ class ChoiceLayer(LayerBase):
         beam_size=base_search_choices.beam_size)
       assert self.search_choices.beam_size == self.output.beam_size
       scores_base = base_search_choices.beam_scores  # (batch, beam_in|1)
-      scores_in = self._get_scores(self.sources[0])  # +log scores, (batch*beam_in, dim)
       assert len(self.sources) == 1
+      scores_in = self._get_scores(self.sources[0])  # +log scores, (batch*beam_in, dim)
+      from TFUtil import filter_ended_scores
+      if self.network.have_rec_step_info():
+        scores_in_dim = self.sources[0].output.dim
+        if scores_in_dim is None:  # can happen if variable length
+          scores_in_dim = tf.shape(self.sources[0].output.placeholder)[self.sources[0].output.feature_dim_axis]
+        scores_in = filter_ended_scores(
+          scores_in,
+          end_flags=self.network.get_rec_step_info().get_end_flag(target_search_choices=base_search_choices),
+          dim=scores_in_dim, batch_dim=tf.shape(scores_in)[0])  # (batch * beam_in, dim)
+        # We also assume that the ground truth output are 0 when the seq ended.
       scores_in_ = batch_gather(scores_in, self.output.placeholder)  # (batch*beam_in,)
       scores_in_ = tf.reshape(scores_in_, (net_batch_dim, base_search_choices.beam_size))  # (batch,beam_in)
       self.search_choices.set_src_beams(expand_dims_unbroadcast(
         tf.range(base_search_choices.beam_size), axis=0, dim=net_batch_dim))
       assert not random_sample_scale
+      assert not length_normalization
+      assert not custom_score_combine
       scores_comb = optional_add(
         optional_mul(scores_in_, prob_scale),
         optional_mul(scores_base, base_beam_score_scale))  # (batch, beam_in, dim)
