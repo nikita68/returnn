@@ -4,6 +4,9 @@ import numpy as np
 
 
 class HMMFactorization(_ConcatInputLayer):
+  """
+  Layer to use attention explicitly in the posterior distribution.
+  """
 
   layer_class = "hmm_factorization"
 
@@ -793,13 +796,29 @@ class HMMFactorization(_ConcatInputLayer):
 
 
 class HMMFactorizationSampledSoftmaxLoss(Loss):
+  """
+  Loss which should be used when using the sampled softmax configuration of the hmm_factorization layer.
+  """
+
   class_name = "hmm_factorization_sampled_loss"
 
   def __init__(self, num_sampled, debug=False, safe_log_opts=None, **kwargs):
+    """
+    Loss which should be used when using the sampled softmax configuration of the hmm_factorization layer.
+    :param int num_sampled: The amount sampled. Should be set to the same value as the setting in hmm_factorization
+    layer.
+    :param bool debug: Whether to enable debug mode.
+    :param dict[str] safe_log_opts: passed to :func:`safe_log`
+    """
     super(HMMFactorizationSampledSoftmaxLoss, self).__init__(**kwargs)
     self.num_sampled = num_sampled
     self.debug = debug
     self.safe_log_opts = safe_log_opts or {}
+
+  @classmethod
+  def transform_config_dict(cls, d, network, get_layer):
+    assert "num_sampled" in d, "hmm_factorization_sampled_loss: num_sampled parameter should be set to the same value" \
+                               "as in the configuration of the hmm_factorization layer!"
 
   def _flatten_or_merge(self, x, seq_lens, time_major):
     """
@@ -813,11 +832,13 @@ class HMMFactorizationSampledSoftmaxLoss(Loss):
     return flatten_with_seq_len_mask(x, seq_lens, time_major=time_major)
 
   def get_value(self):
-    from TFUtil import safe_log, smoothing_cross_entropy_normalized
-
+    """
+    Processes the loss.
+    :return: Unnormzlized loss.
+    """
+    from TFUtil import safe_log
     output = self.output_flat
 
-    # TODO: get self.num_sampled dynamically from previous layer
     output = output[:, self.num_sampled:]  # We assume that the targets are in the last part of the feature dims
 
     # remove duplicates
@@ -831,9 +852,12 @@ class HMMFactorizationSampledSoftmaxLoss(Loss):
     return self.reduce_func(out)
 
   def get_error(self):
+    """
+    Processes the error. Note, that generally this is lower than the true error.
+    :return: Unnormzlized error.
+    """
     output = self.output_flat
 
-    # TODO: get self.num_sampled dynamically from previous layer
     output = output[:, self.num_sampled:]  # We assume that the targets are in the last part of the feature dims
 
     # remove duplicates
@@ -849,21 +873,31 @@ class HMMFactorizationSampledSoftmaxLoss(Loss):
 
 
 class GeometricNormalization(_ConcatInputLayer):
+  """
+  Use normalization based on l2 norm between target embedding and true embedding. Note: has not been proven to work.
+  Also, there is a possible optimization to make the l2 calculation quicker, ask Ringo for details. Needs to use
+  geometric_normalization_loss or geometric_ce_loss as the loss function.
+  """
 
   layer_class = "geometric_normalization"
 
-  def __init__(self, target_embedding_layer, n_out, **kwargs):
+  def __init__(self, target_embedding_layer, **kwargs):
+    """
+    Use normalization based on l2 norm between target embedding and true embedding. Note: has not been proven to work.
+    Also, there is a possible optimization to make the l2 calculation quicker, ask Ringo for details. Needs to use
+  geometric_normalization_loss as the loss function.
+    :param LayerBase target_embedding_layer: Layer of target embeddings.
+    """
+
     super(GeometricNormalization, self).__init__(**kwargs)
 
     # TODO: add asserts
-
     decoder_output_dis = self.input_data.placeholder  # of shape [<?>,...,<?>, embedding_size]
-    from TFUtil import nan_to_num
     decoder_output_dis = decoder_output_dis  # Remove nans in input_data?
 
-    # TODO: make less hacky
     self.word_embeddings = tf.get_default_graph().get_tensor_by_name(
-                        target_embedding_layer.get_base_absolute_name_scope_prefix() + "W:0")  # [vocab_size, embedding_size]
+                        target_embedding_layer.get_base_absolute_name_scope_prefix() +
+                        "W:0")  # [vocab_size, embedding_size]
 
     # set shaping info correctly
     for d in range(len(decoder_output_dis.shape) - 1):  # -1 due to not wanting to add feature dim
@@ -881,7 +915,8 @@ class GeometricNormalization(_ConcatInputLayer):
 
     if self.network.search_flag is False:
       from TFUtil import OutputWithActivation
-      self.output_before_activation = OutputWithActivation(self.input_data.placeholder)  # Actually not doing activation here
+      # Actually not doing activation here
+      self.output_before_activation = OutputWithActivation(self.input_data.placeholder)
     self.output.placeholder = output_geometric
 
   @classmethod
@@ -892,11 +927,20 @@ class GeometricNormalization(_ConcatInputLayer):
 
 class GeometricNormalizationLoss(Loss):
   """
-  geometric_normalization loss function
+  Loss function for the geometric_normalization layer. Uses regression for training.
+  This needs to be used for geometric_normalization. Again, can be further optimized.
   """
   class_name = "geometric_normalization_loss"
 
   def __init__(self, target_embedding_layer, min_regularizer=0.0, max_regularizer=0.0, debug=False, **kwargs):
+    """
+
+    :param target_embedding_layer:
+    :param min_regularizer:
+    :param max_regularizer:
+    :param debug:
+    :param kwargs:
+    """
     super(GeometricNormalizationLoss, self).__init__(**kwargs)
     # Get embedding weights
     self.embedding_weights = None
@@ -906,11 +950,8 @@ class GeometricNormalizationLoss(Loss):
     self.debug = debug
 
   def get_value(self):
-
     assert self.target.sparse, "GeometricNormalizationLoss: Supporting only sparse targets"
 
-    # TODO: scopes
-    # TODO: make less hacky
     self.embedding_weights = tf.get_default_graph().get_tensor_by_name(
                       self.target_embedding_layer.get_base_absolute_name_scope_prefix() + "W:0")  # [vocab_size, embedding_size]
 
@@ -970,7 +1011,9 @@ class GeometricNormalizationLoss(Loss):
 
 class GeometricCrossEntropy(Loss):
   """
-  geometric_normalization loss function
+  Loss function for the geometric_normalization layer. Uses cross entropy for training.
+  This needs to be used for geometric_normalization. Again, can
+  be further optimized.
   """
   class_name = "geometric_ce_loss"
 
