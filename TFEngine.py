@@ -753,8 +753,8 @@ class Engine(EngineBase):
     Resets the default graph (of the current thread),
     and clears up any cached tensors created in it.
     """
-    from TFUtil import call_graph_reset_callbacks
-    call_graph_reset_callbacks()
+    if self.network:
+      self.network.call_graph_reset_callbacks()
     tf.reset_default_graph()
     self._checked_uninitialized_vars = False
     self._merge_all_summaries = None
@@ -1189,6 +1189,9 @@ class Engine(EngineBase):
       new_network_desc = self.pretrain.get_network_json_for_epoch(self.epoch)
       # Always update config, if needed, even if nothing changed.
       # This might trigger enforcing some learning rate, or so.
+      if self.network.layers_desc != new_network_desc:
+        # Early call of reset callbacks, which might trigger some HDF dump or other things.
+        self.network.call_graph_reset_callbacks()
       self._maybe_update_config(net_desc=new_network_desc, epoch=self.epoch)
       self.maybe_init_new_network(new_network_desc)
       self.network.declare_train_params(**self.pretrain.get_train_param_args_for_epoch(self.epoch))
@@ -1780,9 +1783,13 @@ class Engine(EngineBase):
         labels = None
 
     assert output_file
-    if not self.config.is_true("forward_override_hdf_output"):
-      assert not os.path.exists(output_file)
     print("Forwarding to HDF file: %s" % output_file, file=log.v2)
+    if self.config.is_true("forward_override_hdf_output"):
+      if os.path.exists(output_file):
+        print("HDF file exists, delete now (forward_override_hdf_output).", file=log.v2)
+        os.remove(output_file)
+    else:
+      assert not os.path.exists(output_file)
     print("Forward output:", output, file=log.v3)
     writer = SimpleHDFWriter(filename=output_file, dim=output.dim, ndim=output.ndim, labels=labels)
 

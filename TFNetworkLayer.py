@@ -3954,13 +3954,18 @@ class ReinterpretDataLayer(_ConcatInputLayer):
 
   # noinspection PyUnusedLocal
   def __init__(self, switch_axes=None, size_base=None, set_axes=None,
-               enforce_batch_major=False, enforce_time_major=False, increase_sparse_dim=None, **kwargs):
+               enforce_batch_major=False, enforce_time_major=False,
+               set_sparse=None, set_sparse_dim=NotSpecified, increase_sparse_dim=None,
+               **kwargs):
     """
     :param str|list[str] switch_axes: e.g. "bt" to switch batch and time axes
     :param LayerBase|None size_base:
     :param dict[str,int|str] set_axes: the key is "B","T","F", value is via :func:`Data.get_axis_from_description`
     :param bool enforce_batch_major:
     :param bool enforce_time_major:
+    :param bool|None set_sparse: if bool, set sparse value to this
+    :param int|None|NotSpecified set_sparse_dim: set sparse dim to this. assumes that it is sparse
+    :param int|None increase_sparse_dim: add this to the dim. assumes that it is sparse
     """
     super(ReinterpretDataLayer, self).__init__(**kwargs)
     self.size_base = size_base
@@ -3994,16 +3999,19 @@ class ReinterpretDataLayer(_ConcatInputLayer):
   def get_out_data_from_opts(cls, name, sources,
                              switch_axes=None, size_base=None, set_axes=None,
                              enforce_batch_major=False, enforce_time_major=False,
-                             increase_sparse_dim=None, **kwargs):
+                             set_sparse=None, set_sparse_dim=NotSpecified, increase_sparse_dim=None,
+                             **kwargs):
     """
     :param str name:
     :param list[LayerBase] sources:
     :param str|list[str] switch_axes: e.g. "bt" to switch batch and time axes
-    :param LayerBase|None size_base:
+    :param LayerBase|None size_base: similar as size_target
     :param dict[str,int] set_axes:
     :param bool enforce_batch_major:
     :param bool enforce_time_major:
-    :param int|None increase_sparse_dim: if sparse, add this to the dim
+    :param bool|None set_sparse: if bool, set sparse value to this
+    :param int|None|NotSpecified set_sparse_dim: set sparse dim to this. assumes that it is sparse
+    :param int|None increase_sparse_dim: add this to the dim. assumes that it is sparse
     """
     out = get_concat_sources_data_template(sources, name="%s_output" % name)
     assert not (enforce_batch_major and enforce_time_major)
@@ -4043,6 +4051,12 @@ class ReinterpretDataLayer(_ConcatInputLayer):
           out.dim = out.batch_shape[out.feature_dim_axis]
     if size_base:
       out.size_placeholder = size_base.output.size_placeholder.copy()
+    if set_sparse is not None:
+      assert isinstance(set_sparse, bool)
+      out.sparse = set_sparse
+    if set_sparse_dim is not NotSpecified:
+      assert set_sparse_dim is None or isinstance(set_sparse_dim, int)
+      out.dim = set_sparse_dim
     if increase_sparse_dim:
       assert out.sparse
       out.dim += increase_sparse_dim
@@ -6655,7 +6669,6 @@ class HDFDumpLayer(LayerBase):
     self.output = self.sources[0].output.copy("%s_output" % self.name)
     data = self.output.copy_as_batch_spatial_major()  # need batch-major for SimpleHDFWriter
 
-    from TFUtil import register_graph_reset_callback
     from HDFDataset import SimpleHDFWriter
     import numpy
     import sys
@@ -6670,8 +6683,10 @@ class HDFDumpLayer(LayerBase):
     if dump_whole_batches:
       ndim = data.ndim - len(data.size_placeholder) + 1
     ndim_without_features = ndim - (0 if data.sparse else 1)
-    self.hdf_writer = SimpleHDFWriter(filename=filename, dim=data.dim, ndim=ndim)
-    register_graph_reset_callback(self._at_graph_reset)
+    # Open the HDF writer lazily. We only want to start writing (or overwriting) once we really start.
+    # E.g. when just building the graph for importing a model,
+    # it should not touch (delete/overwrite) an existing file!
+    self.hdf_writer = None
 
     def py_write(data_np, tags, sizes, *extras):
       """
@@ -6683,8 +6698,14 @@ class HDFDumpLayer(LayerBase):
       """
       # noinspection PyBroadException
       try:
+        if not self.hdf_writer:
+          self.hdf_writer = SimpleHDFWriter(
+            filename=filename, dim=data.dim, ndim=ndim,
+            extra_type={key: (value.dim, value.ndim, value.dtype) for (key, value) in self.extra.items()})
+          self.network.register_graph_reset_callback(self._at_graph_reset)
+
         n_batch = data_np.shape[0]
-        assert sizes.shape == (len(data.size_placeholder), n_batch)
+        assert sizes.shape == (len(data.size_placeholder), n_batch) if data.size_placeholder else (0,)
         assert len(sizes) == len(data.size_placeholder)
         seq_lens = {i: size for (i, size) in zip(sorted(data.size_placeholder.keys()), sizes)}
         # There may be axes with a fixed length other than the batch and feature axes.
@@ -6731,6 +6752,7 @@ class HDFDumpLayer(LayerBase):
   def _at_graph_reset(self):
     print("HDFDumpLayer, wrote %i seqs to file %r." % (self.num_seqs_written, self.filename))
     self.hdf_writer.close()
+    self.hdf_writer = None
 
   @classmethod
   def get_out_data_from_opts(cls, name, sources, **kwargs):
@@ -6900,11 +6922,14 @@ class Loss(object):
   class_name = None  # type: str  # used by get_loss_class()
   recurrent = False  # if this is a frame-wise criteria, this will be False
 
-  def __init__(self, base_network, use_flatten_frames=True, use_normalized_loss=False, scale=1.0):
+  def __init__(self, base_network, use_flatten_frames=True,
+               use_normalized_loss=False, custom_norm_factor=None,
+               scale=1.0):
     """
     :param TFNetwork.TFNetwork base_network:
     :param bool use_flatten_frames: will use :func:`TFUtil.flatten_with_seq_len_mask`
     :param bool use_normalized_loss: the loss used in optimization will be normalized
+    :param float|function|None custom_norm_factor:
     :param float scale: additional scale factor for the loss
     """
     self.base_network = base_network
@@ -6922,6 +6947,7 @@ class Loss(object):
     # Maybe make configurable. For now, same as in our Theano behavior.
     self.loss_norm_factor = None  # type: typing.Optional[tf.Tensor]
     self.use_normalized_loss = use_normalized_loss
+    self.custom_norm_factor = custom_norm_factor
     self.scale = scale
 
   def _reduce_batch_time(self):
@@ -7108,6 +7134,12 @@ class Loss(object):
         if target:
           assert not self.target.have_time_axis()
           self.target_flat = target.placeholder
+      if self.custom_norm_factor is not None:
+        if callable(self.custom_norm_factor):
+          self.loss_norm_factor = self.custom_norm_factor(self=self, output=output, layer=layer)
+        else:
+          assert isinstance(self.custom_norm_factor, float)
+          self.loss_norm_factor = self.custom_norm_factor
       self._check_init()
 
   def _check_init(self):
