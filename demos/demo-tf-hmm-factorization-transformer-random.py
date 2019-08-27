@@ -15,12 +15,12 @@ print("Hello, experiment: %s" % demo_name)
 # task
 use_tensorflow = True
 task = "train"
-in_loop = False  # IMPORTANT: SET THIS TO TRUE IN SEARCH, FALSE IN TRAIN <-----------------------------------------------
+in_loop = True  # IMPORTANT: SET THIS TO TRUE IN SEARCH, FALSE IN TRAIN <-----------------------------------------------
 
 # data
 train = {"class": "TaskEpisodicCopyDataset", "num_seqs": 100}
-num_inputs = 38
-num_outputs = 38
+num_inputs = 10
+num_outputs = 10
 #train = {"class": "TaskXmlModelingDataset", "num_seqs": 100}
 #num_inputs = 12
 #num_outputs = 12
@@ -37,32 +37,48 @@ def select_random_layer_and_head(sources, in_loop):
     import tensorflow as tf
 
     # TODO: update this
-    # TODO: each input is of shape? [B, H, I, J]??
+    # TODO: each input is of shape? [B, I, H, J] and [B, H, 1, J]??
 
     # First select layer
-    print(sources)
-    sources = tf.stack(sources, axis=0)  # [layer, B, H, (I,) J]
+    sources = tf.Print(sources, [tf.shape(sources)], summarize=100, message="sources")
+
+    sources = tf.stack(sources, axis=0)  # [layers, B, (I,) H, J]
+    sources = tf.Print(sources, [tf.shape(sources)], summarize=100, message="sources 2")
+
     sources = tf.gather(sources, tf.random_shuffle(tf.range(tf.shape(sources)[0])))
-    layer_to_use = sources[0]
-    print(layer_to_use)
+    layer_to_use = sources[0]  # [B, (I,) H, J]
+
+    layer_to_use = tf.Print(layer_to_use, [tf.shape(layer_to_use)], summarize=100, message="layer_to_use")
 
     # Select head
     if in_loop:
+        layer_to_use = tf.squeeze(layer_to_use, axis=-2)
         att_perm = [1, 0, 2]
     else:
-        att_perm = [1, 0, 2, 3]
+        att_perm = [2, 0, 1, 3]
 
-    layer_to_use = tf.transpose(layer_to_use, perm=att_perm)  # TODO: something is not right
-    print(layer_to_use)
+    layer_to_use = tf.transpose(layer_to_use, perm=att_perm)
+
+    layer_to_use = tf.Print(layer_to_use, [tf.shape(layer_to_use)], summarize=100, message="layer_to_use 2")
+
     layer_to_use = tf.gather(layer_to_use, tf.random_shuffle(tf.range(tf.shape(layer_to_use)[0])))
     head_to_use = layer_to_use[0]
 
-    print(head_to_use)
+    head_to_use = tf.Print(head_to_use, [tf.shape(head_to_use)], summarize=100, message="head_to_use")
 
     if not in_loop:
         head_to_use = tf.expand_dims(head_to_use, axis=-2)
 
-    print(head_to_use)  # TODO: should be then [B, (I,), 1, J]
+    # TODO: should be then [B, (I,), 1, J]
+
+    head_to_use = tf.Print(head_to_use, [tf.shape(head_to_use)], summarize=100, message="head_to_use 2")
+
+    if in_loop:
+        att_perm_2 = [0, 1, 2]
+    else:
+        att_perm_2 = [0, 2, 1, 3]
+
+    head_to_use = tf.transpose(head_to_use, perm=att_perm_2)
 
     return head_to_use
 
@@ -214,9 +230,12 @@ class TransformerNetwork:
                 "att_selector": {"class": "eval", "from": ["dec_01_att_weights", "dec_02_att_weights", "dec_03_att_weights", "dec_04_att_weights",
                                                       "dec_05_att_weights", "dec_06_att_weights"],
                                   "eval": "self.network.get_config().typed_value('select_random_layer_and_head')([source(i) for i in range(6)], self.network.get_config().bool('in_loop', False))",
+                                  "eval_locals": {"auto_convert": False, "enforce_batch_major": True},
                                   "n_out": 1,
-                                  "out_type": {"feature_dim_axis": 1,
-                                               "shape": (1, None)},
+                                  "out_type": {"feature_dim_axis": 2,
+                                               "time_dim_axis": 3,
+                                               "shape": (None, 1, None),
+                                               },
                                   },
                                   #"out_type": {"dim": 1, "shape": (1, None) if in_loop else (1, None, None), "size_placeholder": {0: 1}}},
 

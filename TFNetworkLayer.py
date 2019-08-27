@@ -5565,6 +5565,9 @@ class CombineLayer(LayerBase):
       self.output_before_activation = OutputWithActivation(x)
     x = self.output_before_activation.y
     self.output.placeholder = x
+    if kind is "eval":
+      # TODO: not do this so hackily
+      self.output.size_placeholder = sources[0].output.size_placeholder
 
   @classmethod
   def get_out_data_from_opts(cls, n_out=NotSpecified, out_type=None, sources=(), **kwargs):
