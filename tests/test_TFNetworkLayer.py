@@ -384,6 +384,48 @@ def test_activation_layer_net_construct_two_out():
     assert_equal(v.tolist(), [[[0, 0], [0, 0], [2, 2]]])
 
 
+def test_cnn_building_block():
+  with make_scope() as session:
+    num_inputs = 192
+    channel_num = 32
+    feature_dim = 6
+    filters = 32
+    filter_size = (3, 3)
+    config = Config()
+    config.update({
+      "num_inputs": num_inputs,
+      "num_outputs": filters,
+      "network": {
+        "split": {"class": "split_dims", "axis": "f", "dims": (channel_num, feature_dim), "from": ["data"]},
+        "swap_axes": {"class": "swap_axes", "axis1": "s:1", "axis2": "f", "from": ["split"]},
+        "c1": {"class": "conv", "n_out": filters, "filter_size": filter_size, "auto_use_channel_first": False,
+               "strides": (1, 1), "dilation_rate": (1, 1), "padding": "SAME", "activation": None, "with_bias": False,
+               "from": "swap_axes"},
+        "bn1": {"class": "batch_norm", "from": "c1"},
+        "y1": {"class": "activation", "activation": "relu", "batch_norm": False, "from": "bn1"},
+        "c2": {"class": "conv", "n_out": filters, "filter_size": filter_size, "auto_use_channel_first": False,
+               "strides": (1, 1), "dilation_rate": (1, 1), "padding": "SAME", "activation": None, "with_bias": False,
+               "from": "y1"},
+        "p": {"class": "combine", "kind": "add", "from": ["c2", "swap_axes"]},
+        "bn2": {"class": "batch_norm", "from": "p"},
+        "y2": {"class": "activation", "activation": "relu", "batch_norm": False, "from": "bn2"},
+
+        "out_pool": {"class": "reduce", "mode": "avg", "axes": "s:1", "keep_dims": False, "from": "y2"},
+        "output": {"class": "copy", "from": ["out_pool"], "is_output_layer": True}
+      }})
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(config.typed_value("network"))
+    session.run(tf.global_variables_initializer())
+    out = network.layers["output"].output.placeholder
+    n_batch = 5
+    seq_len = 10
+    seq_lens = numpy.array([10, 10, 10, 10, 10], dtype=numpy.int32)
+    feed = {network.extern_data.get_default_input_data().placeholder:
+            numpy.random.rand(n_batch, seq_len, num_inputs).astype('f'),
+            network.extern_data.get_default_input_data().size_placeholder[0]: seq_lens}
+    v = session.run(out, feed_dict=feed)
+
+
 def test_combine_layer_net_construct():
   with make_scope() as session:
     net_dict = {
@@ -2274,6 +2316,51 @@ def test_HDFDumpLayer():
   assert_equal(reader.data["data"][0].shape, (seq_lens[0], n_out))
 
 
+def test_HDFDumpLayer_sparse():
+  import os
+  from test_HDFDataset import get_test_tmp_file, DatasetTestReader, HDFDataset
+  hdf_filename = get_test_tmp_file(".hdf")
+  os.remove(hdf_filename)  # HDFDumpLayer expects that the file does not exist
+
+  with make_scope() as session:
+    n_in, n_out = 4, 5
+    config = Config()
+    config.update({
+      "num_inputs": n_in,
+      "num_outputs": n_out,
+      "network": {
+        "dump": {
+          "class": "hdf_dump", "filename": hdf_filename, "from": "data:classes",
+          "is_output_layer": True
+        },
+      }})
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(config.typed_value("network"))
+
+    session.run(tf.global_variables_initializer())
+    n_batch = 1
+    classes_data = numpy.array([[2, 5, 6]], dtype="int32")
+    classes_seq_lens = [classes_data.shape[1]]
+    assert classes_data.shape == (n_batch, classes_seq_lens[0])
+    input_tags = numpy.array([b"seq-0"], dtype="S5")
+    feed = {network.extern_data.data["classes"].placeholder: classes_data,
+            network.extern_data.data["classes"].size_placeholder[0]: classes_seq_lens,
+            network.extern_data.data["seq_tag"].placeholder: input_tags}
+    session.run(network.get_fetches_dict(), feed_dict=feed)
+
+    network.call_graph_reset_callbacks()
+
+  assert os.path.exists(hdf_filename)
+  reader = DatasetTestReader(HDFDataset([hdf_filename]))
+  reader.read_all()
+  assert reader.num_seqs == 1
+  assert reader.seq_tags == ["seq-0"]
+  assert_equal(reader.seq_lens[0]["data"], classes_seq_lens[0])
+  assert_equal(reader.data["data"][0].shape, (classes_seq_lens[0],))
+  assert_equal(reader.data_sparse["data"], True)
+  assert_equal(reader.dataset.get_data_dim("data"), n_out)
+
+
 def test_HDFDumpLayer_fixed_length():
   import os
   from test_HDFDataset import get_test_tmp_file, DatasetTestReader, HDFDataset
@@ -2312,7 +2399,6 @@ def test_HDFDumpLayer_fixed_length():
     feed = {network.extern_data.data["data"].placeholder: input_data,
             network.extern_data.data["data"].size_placeholder[0]: seq_lens,
             network.extern_data.data["seq_tag"].placeholder: input_tags}
-    assert_equal(feed[network.extern_data.get_default_input_data().placeholder].shape, (n_batch, seq_len, n_in))
     session.run([out, network.get_post_control_dependencies()], feed_dict=feed)
 
     network.call_graph_reset_callbacks()

@@ -6634,6 +6634,7 @@ class PrintLayer(LayerBase):
     with tf.name_scope("print_layer"):
       source = self.sources[0]
       output = py_print(source.output.placeholder, [source.output.placeholder], kwargs["name"], summarize=99)
+      self.network.register_post_control_dependencies([output])
       self.output.placeholder = output
       self.output.size_placeholder = source.output.size_placeholder.copy()
 
@@ -6750,9 +6751,10 @@ class HDFDumpLayer(LayerBase):
     self.network.register_post_control_dependencies([tf_write])
 
   def _at_graph_reset(self):
-    print("HDFDumpLayer, wrote %i seqs to file %r." % (self.num_seqs_written, self.filename))
-    self.hdf_writer.close()
-    self.hdf_writer = None
+    if self.hdf_writer:
+      print("HDFDumpLayer, wrote %i seqs to file %r." % (self.num_seqs_written, self.filename))
+      self.hdf_writer.close()
+      self.hdf_writer = None
 
   @classmethod
   def get_out_data_from_opts(cls, name, sources, **kwargs):
@@ -7193,7 +7195,7 @@ class Loss(object):
     :rtype: tf.Tensor
     """
     assert self.loss_norm_factor is not None, "init not called?"
-    return self.loss_norm_factor
+    return tf.convert_to_tensor(self.loss_norm_factor)
 
   @classmethod
   def get_auto_output_layer_dim(cls, target_dim):

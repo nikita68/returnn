@@ -25,6 +25,10 @@ attr_ctcIndexTranscription = 'ctcIndexTranscription'
 
 
 class HDFDataset(CachedDataset):
+  """
+  Dataset based on HDF files.
+  This was the main original dataset format of RETURNN.
+  """
 
   def __init__(self, files=None, use_cache_manager=False, **kwargs):
     """
@@ -42,6 +46,16 @@ class HDFDataset(CachedDataset):
     if files:
       for fn in files:
         self.add_file(fn)
+
+  def __del__(self):
+    for f in self.h5_files:
+      # noinspection PyBroadException
+      try:
+        f.close()
+      except Exception:  # e.g. at shutdown. but does not matter
+        pass
+    del self.h5_files[:]
+    del self.file_seq_start[:]
 
   @staticmethod
   def _decode(s):
@@ -217,6 +231,11 @@ class HDFDataset(CachedDataset):
     gc.collect()
 
   def get_data(self, seq_idx, key):
+    """
+    :param int seq_idx:
+    :param str key:
+    :rtype: numpy.ndarray
+    """
     if self.cache_byte_size_total_limit > 0:  # Use the cache?
       return super(HDFDataset, self).get_data(seq_idx, key)
 
@@ -240,11 +259,20 @@ class HDFDataset(CachedDataset):
     return data
 
   def get_input_data(self, sorted_seq_idx):
+    """
+    :param int sorted_seq_idx:
+    :rtype: numpy.ndarray
+    """
     if self.cache_byte_size_total_limit > 0:  # Use the cache?
       return super(HDFDataset, self).get_input_data(sorted_seq_idx)
     return self.get_data(sorted_seq_idx, "data")
 
   def get_targets(self, target, sorted_seq_idx):
+    """
+    :param str target:
+    :param int sorted_seq_idx:
+    :rtype: numpy.ndarray
+    """
     if self.cache_byte_size_total_limit > 0:  # Use the cache?
       return super(HDFDataset, self).get_targets(target, sorted_seq_idx)
     return self.get_data(sorted_seq_idx, target)
@@ -272,29 +300,49 @@ class HDFDataset(CachedDataset):
     return s
 
   def get_tag(self, sorted_seq_idx):
+    """
+    :param int sorted_seq_idx:
+    :rtype: str
+    """
     ids = self._seq_index[self._index_map[sorted_seq_idx]]
     return self._get_tag_by_real_idx(ids)
 
   def get_all_tags(self):
+    """
+    :rtype: list[str]
+    """
     tags = []
     for h5_file in self.h5_files:
       tags += h5_file["seqTags"][...].tolist()
-
     return list(map(self._decode, tags))
 
   def get_total_num_seqs(self):
+    """
+    :rtype: int
+    """
     return self._num_seqs
 
   def is_data_sparse(self, key):
+    """
+    :param str key:
+    :rtype: bool
+    """
     if self.get_data_dtype(key).startswith("int"):
       if key in self.num_outputs:
         return self.num_outputs[key][1] <= 1
     return False
 
   def get_data_dtype(self, key):
+    """
+    :param str key:
+    :rtype: str
+    """
     return self.data_dtype[key]
 
   def len_info(self):
+    """
+    :rtype: str
+    """
     return ", ".join(["HDF dataset",
                       "sequences: %i" % self.num_seqs,
                       "frames: %i" % self.get_num_timesteps()])
@@ -803,6 +851,13 @@ class SiameseHDFDataset(CachedDataset2):
 
 
 class SimpleHDFWriter:
+  """
+  Intended for a simple interface, to dump data on-the-fly into a HDF file,
+  which can be read later by :class:`HDFDataset`.
+
+  Note that we dump to a temp file first, and only at :func:`close` we move it over to the real destination.
+  """
+
   def __init__(self, filename, dim, labels=None, ndim=None, extra_type=None, swmr=False):
     """
     :param str filename: Create file, truncate if exists
@@ -865,6 +920,11 @@ class SimpleHDFWriter:
       self._file.swmr_mode = True
       # See comments in test_SimpleHDFWriter_swmr...
       raise NotImplementedError("SimpleHDFWriter SWMR is not really finished...")
+
+  def __del__(self):
+    if self._file:
+      self._file.close()
+      self._file = None
 
   def _prepare_extra(self, extra_type):
     """
@@ -980,12 +1040,17 @@ class SimpleHDFWriter:
       seq_len = {0: seq_len}
     assert isinstance(seq_len, dict)
     assert all([isinstance(key, int) and isinstance(value, (list, numpy.ndarray)) for (key, value) in seq_len.items()])
-    ndim_with_seq_len = self.ndim - (1 if self.dim else 0)
+    if seq_len:
+      ndim_with_seq_len = max(seq_len.keys()) + 1
+    else:
+      ndim_with_seq_len = 0
+    sparse = ndim_with_seq_len == self.ndim
+    assert ndim_with_seq_len <= self.ndim
     assert all([0 <= key < ndim_with_seq_len for key in seq_len.keys()])
     assert len(seq_len) == ndim_with_seq_len
     assert all([n_batch == len(value) for (key, value) in seq_len.items()])
     assert all([max(value) == inputs.shape[key + 1] for (key, value) in seq_len.items()])
-    if self.dim:
+    if self.dim and not sparse:
       assert self.dim == inputs.shape[-1]
     if extra:
       assert all([n_batch == value.shape[0] for value in extra.values()])
@@ -1002,7 +1067,7 @@ class SimpleHDFWriter:
       flat_seq_len = int(numpy.prod([seq_len[axis][i] for axis in range(ndim_with_seq_len)]))
       assert flat_seq_len > 0
       flat_shape = [flat_seq_len]
-      if self.dim:
+      if self.dim and not sparse:
         flat_shape.append(self.dim)
       self._seq_lengths[seqlen_offset + i, 0] = flat_seq_len
       data = inputs[i]
@@ -1035,7 +1100,9 @@ class SimpleHDFWriter:
     """
     import os
     import shutil
-    self._file.close()
+    if self._file:
+      self._file.close()
+      self._file = None
     if self.tmp_filename:
       assert not os.path.exists(self.filename)
       shutil.copyfile(self.tmp_filename, self.filename)
@@ -1044,6 +1111,12 @@ class SimpleHDFWriter:
 
 
 class HDFDatasetWriter:
+  """
+  Similar as :class:`SimpleHDFWriter`, but is mostly intended to copy an existing dataset,
+  see :func:`dump_from_dataset`.
+  The resulting HDF file can be read later by :class:`HDFDataset`.
+  """
+
   def __init__(self, filename):
     """
     :param str filename: for the HDF to write
@@ -1053,6 +1126,9 @@ class HDFDatasetWriter:
     self.file = h5py.File(filename, "w")
 
   def close(self):
+    """
+    Close the HDF file.
+    """
     self.file.close()
 
   def dump_from_dataset(self, dataset, epoch=1, start_seq=0, end_seq=float("inf"), use_progress_bar=True):
