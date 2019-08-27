@@ -74,6 +74,7 @@ def select_random_layer_and_head(sources, in_loop):
     head_to_use = tf.Print(head_to_use, [tf.shape(head_to_use)], summarize=100, message="head_to_use 2")
 
     if in_loop:
+        head_to_use = tf.expand_dims(head_to_use, axis=-2)
         att_perm_2 = [0, 1, 2]
     else:
         att_perm_2 = [0, 2, 1, 3]
@@ -232,9 +233,9 @@ class TransformerNetwork:
                                   "eval": "self.network.get_config().typed_value('select_random_layer_and_head')([source(i) for i in range(6)], self.network.get_config().bool('in_loop', False))",
                                   "eval_locals": {"auto_convert": False, "enforce_batch_major": True},
                                   "n_out": 1,
-                                  "out_type": {"feature_dim_axis": 2,
-                                               "time_dim_axis": 3,
-                                               "shape": (None, 1, None),
+                                  "out_type": {"feature_dim_axis": 2 if not in_loop else 1,
+                                               "time_dim_axis": 3 if not in_loop else 2,
+                                               "shape": (None, 1, None) if not in_loop else (1, None),
                                                },
                                   },
                                   #"out_type": {"dim": 1, "shape": (1, None) if in_loop else (1, None, None), "size_placeholder": {0: 1}}},
