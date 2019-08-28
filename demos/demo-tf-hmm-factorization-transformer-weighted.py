@@ -15,7 +15,7 @@ print("Hello, experiment: %s" % demo_name)
 # task
 use_tensorflow = True
 task = "train"
-in_loop = False  # IMPORTANT: SET THIS TO TRUE IN SEARCH, FALSE IN TRAIN <-----------------------------------------------
+in_loop = True  # IMPORTANT: SET THIS TO TRUE IN SEARCH, FALSE IN TRAIN <-----------------------------------------------
 
 # data
 train = {"class": "TaskEpisodicCopyDataset", "num_seqs": 100}
@@ -33,42 +33,30 @@ vocab_size = 12
 intermediary_size = 100
 
 
-def select_random_layer_and_head(sources, in_loop):
+def weight_all_heads(sources, in_loop):
     import tensorflow as tf
 
-    sources = tf.stack(sources, axis=0)  # [layers, B, H, (I,) J]
+    num_heads_times_layers = 48
 
-    sources = tf.gather(sources, tf.random_shuffle(tf.range(tf.shape(sources)[0])))
-    layer_to_use = sources[0]  # [B, H, (I,) J]
+    sources = tf.stack(sources, axis=0)  # [layers, B, H, (I/1), J]
 
-    # Select head
-    if in_loop:
-      layer_to_use = tf.squeeze(layer_to_use, axis=-2)
-      att_perm = [1, 0, 2]
-    else:
-      att_perm = [1, 0, 2, 3]
+    sources_shape = tf.shape(sources)
 
-    layer_to_use = tf.transpose(layer_to_use, perm=att_perm)  # [H, B, (I,) J]
+    s_shape = [num_heads_times_layers, sources_shape[1], sources_shape[3], sources_shape[4]]
 
-    # layer_to_use = tf.Print(layer_to_use, [tf.shape(layer_to_use)], summarize=100, message="layer_to_use 2")
+    sources = tf.reshape(sources, shape=s_shape)  # [layers * H, B, (I/1), J]
+    sources = tf.transpose(sources, perm=[1, 2, 3, 0])  # [B, (I/1), J, layers * H]
 
-    layer_to_use = tf.gather(layer_to_use, tf.random_shuffle(tf.range(tf.shape(layer_to_use)[0])))
-    head_to_use = layer_to_use[0]
+    distribution_over_sources = tf.layers.dense(sources, num_heads_times_layers)  # [B, (I/1), J, layers * H]
+    distribution_over_sources = tf.nn.softmax(distribution_over_sources, axis=-1)  # TODO: check if this is correct--------------------------------
 
-    # head_to_use = tf.Print(head_to_use, [tf.shape(head_to_use)], summarize=100, message="head_to_use")
+    head_to_use = tf.multiply(sources, distribution_over_sources)  # [B, (I/1), J, layers * H]
+    head_to_use = tf.reduce_sum(head_to_use, axis=-1, keepdims=True)  # [B, (I/1), J, 1]
 
-    head_to_use = tf.expand_dims(head_to_use, axis=-2)
-
-    # TODO: should be then [B, (I,), 1, J]
-
-    # head_to_use = tf.Print(head_to_use, [tf.shape(head_to_use)], summarize=100, message="head_to_use 2")
+    head_to_use = tf.transpose(head_to_use, perm=[0, 3, 1, 2])  # [B, 1, (I/1), J]
 
     if in_loop:
-      att_perm_2 = [0, 1, 2]
-    else:
-      att_perm_2 = [0, 2, 1, 3]
-
-    head_to_use = tf.transpose(head_to_use, perm=att_perm_2)  # [B, 1, I, J] or [B, 1, J]
+        head_to_use = tf.squeeze(head_to_use, axis=-2)
 
     return head_to_use
 
@@ -219,7 +207,7 @@ class TransformerNetwork:
 
                 "att_selector": {"class": "eval", "from": ["dec_01_att_weights", "dec_02_att_weights", "dec_03_att_weights", "dec_04_att_weights",
                                                       "dec_05_att_weights", "dec_06_att_weights"],
-                                  "eval": "self.network.get_config().typed_value('select_random_layer_and_head')([source(i) for i in range(6)], self.network.get_config().bool('in_loop', False))",
+                                  "eval": "self.network.get_config().typed_value('weight_all_heads')([source(i) for i in range(6)], self.network.get_config().bool('in_loop', False))",
                                  "auto_convert": False, "enforce_batch_major": True,
                                   "n_out": 1,
                                   "out_type": {"feature_dim_axis": 1 if not in_loop else 1,
