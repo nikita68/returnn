@@ -5528,8 +5528,8 @@ class CombineLayer(LayerBase):
 
   # noinspection PyShadowingBuiltins
   def __init__(self, kind, sources, activation=None, with_bias=False,
-               eval=None, eval_locals=None, eval_for_output_loss=False,
-               **kwargs):
+               eval=None, eval_locals=None, eval_for_output_loss=False, auto_convert=True, enforce_batch_major=False,
+               as_data=False, **kwargs):
     """
     :param str kind: e.g. "average" or "add", or "eval"
     :param list[LayerBase] sources:
@@ -5542,7 +5542,8 @@ class CombineLayer(LayerBase):
     super(CombineLayer, self).__init__(sources=sources, **kwargs)
     assert kind in ["average", "add", "sub", "mul", "eval"], (
       "%s: Invalid `kind` %r for this layer." % (self, kind))
-    op = self._get_op(kind=kind, eval_str=eval, eval_locals=eval_locals)
+    op = self._get_op(kind=kind, eval_str=eval, eval_locals=eval_locals, auto_convert=auto_convert,
+                      enforce_batch_major=enforce_batch_major, as_data=as_data)
     x = op(sources)
     if eval_for_output_loss:
       assert eval
@@ -5645,7 +5646,8 @@ class CombineLayer(LayerBase):
     x /= len(sources)
     return x
 
-  def _op_kind_eval(self, sources, eval_str, eval_locals=None):
+  def _op_kind_eval(self, sources, eval_str, eval_locals=None, auto_convert=True, enforce_batch_major=False,
+                    as_data=False):
     """
     :param list[LayerBase]|list[tf.Tensor] sources:
     :param str|callable eval_str:
@@ -5654,7 +5656,7 @@ class CombineLayer(LayerBase):
     """
     used_sources = set()  # type: typing.Set[int]
 
-    def source(i, auto_convert=True, enforce_batch_major=False, as_data=False):
+    def source(i):
       """
       :param int i: layer index
       :param bool auto_convert:
@@ -5692,7 +5694,7 @@ class CombineLayer(LayerBase):
     assert isinstance(x, tf.Tensor), "%r: eval %r did not return a tensor" % (self, eval_str)
     return x
 
-  def _get_op(self, kind, eval_str=None, eval_locals=None):
+  def _get_op(self, kind, eval_str=None, eval_locals=None, auto_convert=True, enforce_batch_major=False, as_data=False):
     """
     :param str kind:
     :param str|callable eval_str:
@@ -5708,7 +5710,8 @@ class CombineLayer(LayerBase):
         :param list[LayerBase] sources:
         :rtype: tf.Tensor
         """
-        return self._op_kind_eval(sources, eval_str=eval_str, eval_locals=eval_locals)
+        return self._op_kind_eval(sources, eval_str=eval_str, eval_locals=eval_locals, auto_convert=auto_convert,
+                                  enforce_batch_major=enforce_batch_major, as_data=as_data)
       op = wrap_eval_op
     return op
 
