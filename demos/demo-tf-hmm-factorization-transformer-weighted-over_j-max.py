@@ -15,7 +15,7 @@ print("Hello, experiment: %s" % demo_name)
 # task
 use_tensorflow = True
 task = "train"
-in_loop = True  # IMPORTANT: SET THIS TO TRUE IN SEARCH, FALSE IN TRAIN <-----------------------------------------------
+in_loop = False  # IMPORTANT: SET THIS TO TRUE IN SEARCH, FALSE IN TRAIN <-----------------------------------------------
 
 # data
 train = {"class": "TaskEpisodicCopyDataset", "num_seqs": 100}
@@ -48,8 +48,11 @@ def weight_all_heads(sources, in_loop):
     sources = tf.transpose(sources, perm=[1, 2, 3, 0])  # [B, (I/1), J, layers * H]
 
     distribution_over_sources = tf.layers.dense(sources, num_heads_times_layers)  # [B, (I/1), J, layers * H]
+    distribution_over_sources = tf.reduce_max(distribution_over_sources, axis=-2,
+                                              keepdims=True)  # [B, (I/1), 1, layers * H]
     distribution_over_sources = tf.nn.softmax(distribution_over_sources, axis=-1)
 
+    # Use auto broadcasting for multiplication
     head_to_use = tf.multiply(sources, distribution_over_sources)  # [B, (I/1), J, layers * H]
     head_to_use = tf.reduce_sum(head_to_use, axis=-1, keepdims=True)  # [B, (I/1), J, 1]
 
@@ -57,6 +60,9 @@ def weight_all_heads(sources, in_loop):
 
     if in_loop:
         head_to_use = tf.squeeze(head_to_use, axis=-2)
+
+    #head_to_use = tf.Print(head_to_use, [tf.reduce_sum(head_to_use, axis=-1, keepdims=True)[0, 0, 0]],
+                           #message="Sanity check: ")
 
     return head_to_use
 
